@@ -22,8 +22,9 @@ echo ">> Checking out pinned commit $GRBLHAL_COMMIT ..."
 git checkout -q "$GRBLHAL_COMMIT"
 git submodule update --init --recursive -q
 
-echo ">> Installing board map ..."
+echo ">> Installing board map + board init ..."
 cp "$HERE/boards/rts1_map.h" boards/rts1_map.h
+cp "$HERE/boards/rts1.c"     boards/rts1.c
 
 echo ">> Wiring BOARD_RTS1 into Inc/driver.h ..."
 if ! grep -q 'BOARD_RTS1' Inc/driver.h; then

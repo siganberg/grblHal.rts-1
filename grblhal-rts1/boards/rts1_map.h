@@ -16,6 +16,7 @@
 
 #define BOARD_NAME "RealTime CNC RTS-1"
 #define BOARD_URL  "https://realtimecnc.com"
+#define HAS_BOARD_INIT          // board_init() in boards/rts1.c asserts fans + power enable at boot
 
 // ============================ Stepper motion ============================
 // Driver order (PROVISIONAL): 0=X 1=Y 2=Y2(ganged) 3=Z 4=A
@@ -86,22 +87,18 @@
 
 #define AUXOUTPUT0_PORT         GPIOA   // Spindle PWM (TIM5_CH1)
 #define AUXOUTPUT0_PIN          0
-#define AUXOUTPUT1_PORT         GPIOC   // Spindle enable / on-off (PROVISIONAL)
-#define AUXOUTPUT1_PIN          15
-#define AUXOUTPUT2_PORT         GPIOA   // RS-485 DE/RE (ISL3485) -> Modbus direction
-#define AUXOUTPUT2_PIN          8
+#define AUXOUTPUT1_PORT         GPIOA   // RS-485 DE/RE (ISL3485) -> Modbus direction
+#define AUXOUTPUT1_PIN          8
 
-// RS-485 direction (DE) pin for the Modbus plugin = aux output 2 (PA8).
-// NOTE: verify the resolved aux index at bring-up (scope PA8 during a Modbus frame).
-#define MODBUS_DIR_AUX          2
+// RS-485 direction (DE) pin for the Modbus plugin = aux output 1 (PA8).
+#define MODBUS_DIR_AUX          1
+
+// NOTE: PA15, PB15, PC15 are NOT grbl-managed here. board_init() (boards/rts1.c)
+// drives them HIGH at boot = 2 cooling fans + master logic enable (stock power-on).
 
 #if DRIVER_SPINDLE_ENABLE & SPINDLE_PWM
 #define SPINDLE_PWM_PORT        AUXOUTPUT0_PORT
 #define SPINDLE_PWM_PIN         AUXOUTPUT0_PIN
-#endif
-#if DRIVER_SPINDLE_ENABLE & SPINDLE_ENA
-#define SPINDLE_ENABLE_PORT     AUXOUTPUT1_PORT
-#define SPINDLE_ENABLE_PIN      AUXOUTPUT1_PIN
 #endif
 
 // ============================ Control + probe inputs (PROVISIONAL) ============================
