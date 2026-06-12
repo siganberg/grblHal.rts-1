@@ -7,3 +7,5 @@ __pycache__/
 .DS_Store
 
 # Note: firmware/*.bin ARE tracked on purpose — they're the project's key artifacts.
+grblhal/STM32F4xx/.pio/
+grblhal/
