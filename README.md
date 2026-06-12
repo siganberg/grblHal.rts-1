@@ -18,6 +18,12 @@ to replace the stock closed firmware with **grblHAL**.
 - Flash layout: `[48 KB RTS bootloader @0x08000000]` + `[app + image-header @0x0800C000]`.
   The bootloader validates the app (CRC + version in the header).
 
+## Flash / restore helper scripts (`scripts/`)
+Put the controller in DFU mode first (hold **BOOT0** while plugging in USB-C). Each
+script flashes, **verifies by read-back**, then boots — aborting if verification fails.
+- `scripts/flash-grblhal.sh` — flash the custom grblHAL build (build it first via `grblhal-rts1/setup.sh` + `pio run -e RTS1`).
+- `scripts/restore-stock.sh` — restore stock firmware (default **v1.5.9**; `restore-stock.sh 1.4.7` for the original dump).
+
 ## Folders
 - **`firmware/`** — full 256 KB flash dumps (+ option bytes, checksums):
   - `RTS-1_fw_v1.4.7_original_2026-06-11.bin` — first dump (original, pre-update)
