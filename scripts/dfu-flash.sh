@@ -27,6 +27,26 @@ md5of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | awk '{print $1}'; }
 
 dfu_present() { "$DFU" -l 2>/dev/null | grep -q "Found DFU"; }
 
+# Free a serial port a sender app (ncSender/gSender) is holding, so we can write
+# to it. Closes whatever process has it open (SIGTERM, then SIGKILL). Skip with
+# RTS1_NO_KILL=1.
+free_port() {
+  local port="$1" pids
+  command -v lsof >/dev/null 2>&1 || return 0
+  pids="$(lsof -t "$port" 2>/dev/null)"
+  [ -z "$pids" ] && return 0
+  [ "${RTS1_NO_KILL:-0}" = 1 ] && return 0
+  echo ">> $port is held by PID(s) $pids — closing the app to free the port..."
+  kill $pids 2>/dev/null
+  for _ in 1 2 3 4 5 6; do                       # up to ~3s for graceful release
+    [ -z "$(lsof -t "$port" 2>/dev/null)" ] && return 0
+    sleep 0.5
+  done
+  pids="$(lsof -t "$port" 2>/dev/null)"
+  [ -n "$pids" ] && { echo ">> forcing close (PID $pids)"; kill -9 $pids 2>/dev/null; sleep 1; }
+  return 0
+}
+
 # Ask a running grblHAL to reboot into the ROM DFU bootloader by sending "$DFU"
 # over its USB-CDC serial port. Best-effort: returns non-zero if no port found.
 enter_dfu_via_serial() {
@@ -34,13 +54,14 @@ enter_dfu_via_serial() {
   # macOS exposes the CDC ACM device as /dev/cu.usbmodem*; a DFU device does not.
   for port in /dev/cu.usbmodem* /dev/cu.usbserial*; do
     [ -e "$port" ] || continue
+    free_port "$port"                            # close ncSender/gSender if it holds it
     echo ">> Sending \$DFU to $port ..."
     stty -f "$port" 115200 2>/dev/null || true
     # $ is literal inside single quotes; printf renders the CRLF.
     if printf '$DFU\r\n' > "$port" 2>/dev/null; then
       sent=1
     else
-      echo "   (port busy — a sender app likely has it open; close it, or type \$DFU there yourself)"
+      echo "   (port still busy — close the sender app manually, or type \$DFU there)"
     fi
   done
   [ "$sent" = 1 ]

@@ -40,6 +40,9 @@
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
 
+// Short busy-delay for SPI CS setup/hold timing margin (~few us at 84 MHz).
+static void drv_dly (void) { for(volatile int d = 0; d < 240; d++); }
+
 // 8-bit full-duplex SPI1 transfer (direct register access; no HAL SPI module).
 static uint8_t spi_xfer (uint8_t b)
 {
@@ -52,35 +55,55 @@ static uint8_t spi_xfer (uint8_t b)
 static void drv_write (uint8_t i, uint8_t reg, uint8_t data)
 {
     GPIOC->BSRR = (uint32_t)(1u << i) << 16;     // CS_i LOW
+    drv_dly();                                   // CS setup
     spi_xfer((uint8_t)(reg & 0x3F));             // rw=0 (write)
     spi_xfer(data);
     while(SPI1->SR & SPI_SR_BSY);
+    drv_dly();                                   // CS hold
     GPIOC->BSRR = (uint32_t)(1u << i);           // CS_i HIGH
+    drv_dly();                                   // inter-frame gap
 }
 
 static uint8_t drv_read (uint8_t i, uint8_t reg)
 {
     uint8_t v;
     GPIOC->BSRR = (uint32_t)(1u << i) << 16;     // CS_i LOW
+    drv_dly();
     spi_xfer((uint8_t)(0x40 | (reg & 0x3F)));    // rw=1 (read)
     v = spi_xfer(0x00);                          // report byte = register data
     while(SPI1->SR & SPI_SR_BSY);
+    drv_dly();
     GPIOC->BSRR = (uint32_t)(1u << i);           // CS_i HIGH
+    drv_dly();
     return v;
 }
 
-// Send the full config sequence to one driver and confirm EN_OUT read back set.
+// Write a register, then read it back and retry on mismatch. Returns false only
+// if it never verified after several tries.
+static bool drv_cfg_reg (uint8_t i, uint8_t reg, uint8_t data)
+{
+    for(uint8_t t = 0; t < 6; t++) {
+        drv_write(i, reg, data);
+        if(drv_read(i, reg) == data)
+            return true;
+    }
+    return false;
+}
+
+// Configure one driver. EVERY config register is read-back verified (a garbled
+// current/microstep/decay frame previously slipped through and caused a driver
+// to run loud or fault under load). EN_OUT is enabled last.
 static bool drv_configure (uint8_t i)
 {
-    drv_write(i, 0x10, 0xFE);                   // CTRL13: VREF_INT_EN=1
-    drv_write(i, 0x06, 0x3C);                   // CTRL3 : unlock + OCP config
-    drv_write(i, 0x04, 0x0F);                   // CTRL1 : TOFF/DECAY, EN_OUT=0
-    drv_write(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2 : microstep, ext STEP/DIR
-    drv_write(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11: TRQ_DAC run current
-    drv_write(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
-    uint8_t c1 = drv_read(i, 0x04);             // read-modify-write CTRL1
-    drv_write(i, 0x04, (uint8_t)(c1 | 0x80));   // EN_OUT=1 -> outputs ENABLED
-    return (drv_read(i, 0x04) & 0x80) != 0;     // confirm EN_OUT latched
+    bool ok = true;
+    ok &= drv_cfg_reg(i, 0x10, 0xFE);                   // CTRL13: VREF_INT_EN=1
+    ok &= drv_cfg_reg(i, 0x06, 0x3C);                   // CTRL3 : unlock + OCP config
+    ok &= drv_cfg_reg(i, 0x04, 0x0F);                   // CTRL1 : TOFF/DECAY, EN_OUT=0
+    ok &= drv_cfg_reg(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2 : microstep, ext STEP/DIR
+    ok &= drv_cfg_reg(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11: TRQ_DAC run current
+    ok &= drv_cfg_reg(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
+    ok &= drv_cfg_reg(i, 0x04, (uint8_t)(0x0F | 0x80)); // CTRL1 : EN_OUT=1 -> outputs on
+    return ok;
 }
 
 static void rts1_drv8452_init (void)
@@ -106,12 +129,12 @@ static void rts1_drv8452_init (void)
     HAL_GPIO_Init(GPIOC, &cs);
     HAL_GPIO_WritePin(GPIOC, DRV_CS_MASK, GPIO_PIN_SET);
 
-    // SPI1 master, mode 1 (CPOL=0, CPHA=1), 8-bit, MSB-first, BR=/16, soft NSS.
-    // CR1 = 0x031D : SSM|SSI|MSTR|BR(/16)|CPHA  (DFF=0=8bit, LSBFIRST=0=MSB).
+    // SPI1 master, mode 1 (CPOL=0, CPHA=1), 8-bit, MSB-first, soft NSS.
+    // BR=/32 (~2.6 MHz) for timing margin (config is one-shot, speed irrelevant).
     SPI1->CR1 = 0;
     SPI1->CR2 = 0;
     SPI1->CR1 = SPI_CR1_SSM | SPI_CR1_SSI | SPI_CR1_MSTR |
-                (3u << SPI_CR1_BR_Pos) | SPI_CR1_CPHA;
+                (4u << SPI_CR1_BR_Pos) | SPI_CR1_CPHA;
     SPI1->CR1 |= SPI_CR1_SPE;
 
     // Flush the first-frame artifact: the first transfer(s) after SPE can be

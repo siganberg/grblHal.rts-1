@@ -90,9 +90,21 @@
 // NOTE: PA15, PB15, PC15 are NOT grbl-managed here. board_init() (boards/rts1.c)
 // drives them HIGH at boot = 2 cooling fans + master logic enable (stock power-on).
 
+// NOTE: no SPINDLE_PWM here on purpose - PA0's PWM timers (TIM5/TIM2) are used by
+// grblHAL for step/RPM timing, so a PA0 PWM spindle hangs boot. We use a plain
+// on/off spindle instead (DRIVER_SPINDLE_ENABLE = SPINDLE_ENA, no timer).
 #if DRIVER_SPINDLE_ENABLE & SPINDLE_PWM
 #define SPINDLE_PWM_PORT        AUXOUTPUT0_PORT
 #define SPINDLE_PWM_PIN         AUXOUTPUT0_PIN
+#endif
+
+// Spindle on/off enable. Required for the on/off spindle to register (otherwise
+// only Modbus VFDs are selectable -> nuisance timeouts with nothing connected).
+// PB11 is a PLACEHOLDER (unused pin); the real stock spindle on/off line gets
+// wired up when a spindle is actually connected.
+#if DRIVER_SPINDLE_ENABLE & SPINDLE_ENA
+#define SPINDLE_ENABLE_PORT     GPIOB
+#define SPINDLE_ENABLE_PIN      11
 #endif
 
 // ============================ Control + probe inputs (PROVISIONAL) ============================
