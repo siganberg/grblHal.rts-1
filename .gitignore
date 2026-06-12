@@ -1,0 +1,9 @@
+# Python virtual environment
+.venv/
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
+
+# Note: firmware/*.bin ARE tracked on purpose — they're the project's key artifacts.

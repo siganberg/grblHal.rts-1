@@ -1,0 +1,5 @@
+# RTS-1 firmware dumps (STM32F401RC, full 256KB @0x08000000)
+
+3e42f7f466c741458e6a44693627c269  option_bytes.bin
+7a47f94e06ffb5a9411764f67c79751a  RTS-1_fw_v1.4.7_original_2026-06-11.bin
+708d2e93e9bb4bb95677a35a83ef7793  RTS-1_fw_v1.5.9_2026-06-11.bin
