@@ -2,7 +2,8 @@
 #
 # Flash the custom grblHAL firmware to the RTS-1 controller (USB DFU).
 # Build it first:  cd grblhal-rts1 && ./setup.sh && cd STM32F4xx && pio run -e RTS1
-# Then put the controller in DFU mode (hold BOOT0 + plug USB-C) and run this.
+# If grblHAL is already running, just run this — it auto-enters DFU via "$DFU".
+# (First flash from stock, or a non-responsive app: hold BOOT0 + plug USB-C.)
 #
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"

@@ -19,8 +19,12 @@
 #define HAS_BOARD_INIT          // board_init() in boards/rts1.c asserts fans + power enable at boot
 
 // ============================ Stepper motion ============================
-// Driver order (PROVISIONAL): 0=X 1=Y 2=Y2(ganged) 3=Z 4=A
-// STEP all on GPIOB, DIR all on GPIOC, per-driver ENABLE on GPIOB.
+// Driver order: 0=X 1=Y 2=Y2(ganged) 3=Z 4=A
+// STEP + DIR are BOTH on GPIOB (verified by firmware RE). The DRV8452s run in
+// SPI mode: there is NO GPIO stepper-enable -- outputs are enabled over SPI
+// (CTRL1 EN_OUT bit) and current is set via SPI (CTRL11 TRQ_DAC) in board_init().
+// The 5 SPI chip-selects are PC0..PC4 (board-managed in rts1.c) -- these were
+// previously (wrongly) mapped as the DIR pins. SPI1 = PA5/PA6/PA7.
 
 #define STEP_PORT               GPIOB
 #define X_STEP_PIN              0
@@ -28,29 +32,21 @@
 #define Z_STEP_PIN              10
 #define STEP_OUTMODE            GPIO_BITBAND
 
-#define DIRECTION_PORT          GPIOC
-#define X_DIRECTION_PIN         0
-#define Y_DIRECTION_PIN         1
-#define Z_DIRECTION_PIN         3
+#define DIRECTION_PORT          GPIOB       // DIR on GPIOB (PB1/5/9/12/14), not GPIOC
+#define X_DIRECTION_PIN         1
+#define Y_DIRECTION_PIN         5
+#define Z_DIRECTION_PIN         12
 #define DIRECTION_OUTMODE       GPIO_BITBAND
 
-// Per-driver enable (DRV8452). Each axis its own enable line.
-#define X_ENABLE_PORT           GPIOB
-#define X_ENABLE_PIN            1
-#define Y_ENABLE_PORT           GPIOB
-#define Y_ENABLE_PIN            5
-#define Z_ENABLE_PORT           GPIOB
-#define Z_ENABLE_PIN            12
+// No *_ENABLE_PIN: DRV8452 output-enable is over SPI (EN_OUT), see board_init().
 
 // ---- A axis = motor M3 (driver 4) ----
 #if N_ABC_MOTORS > 0
 #define M3_AVAILABLE
 #define M3_STEP_PORT            GPIOB
 #define M3_STEP_PIN             13
-#define M3_DIRECTION_PORT       GPIOC
-#define M3_DIRECTION_PIN        4
-#define M3_ENABLE_PORT          GPIOB
-#define M3_ENABLE_PIN           14
+#define M3_DIRECTION_PORT       GPIOB
+#define M3_DIRECTION_PIN        14
 #endif
 
 // ---- Ganged Y2 = motor M4 (driver 2), for Y auto-squaring ----
@@ -58,10 +54,8 @@
 #define M4_AVAILABLE
 #define M4_STEP_PORT            GPIOB
 #define M4_STEP_PIN             8
-#define M4_DIRECTION_PORT       GPIOC
-#define M4_DIRECTION_PIN        2
-#define M4_ENABLE_PORT          GPIOB
-#define M4_ENABLE_PIN           9
+#define M4_DIRECTION_PORT       GPIOB
+#define M4_DIRECTION_PIN        9
 #endif
 
 // ============================ Limit inputs (PROVISIONAL) ============================
@@ -102,12 +96,12 @@
 #endif
 
 // ============================ Control + probe inputs (PROVISIONAL) ============================
+// NOTE: PB15 is a cooling fan driven by board_init() (active-low), NOT an input.
+// The tool-setter / second probe needs a different free pin (TBD at bring-up).
 #define AUXINPUT0_PORT          GPIOC   // Reset / E-stop
 #define AUXINPUT0_PIN           13
 #define AUXINPUT1_PORT          GPIOC   // Probe
 #define AUXINPUT1_PIN           14
-#define AUXINPUT2_PORT          GPIOB   // Tool setter (second probe)
-#define AUXINPUT2_PIN           15
 
 #if CONTROL_ENABLE & CONTROL_HALT
 #define RESET_PORT              AUXINPUT0_PORT
@@ -117,11 +111,6 @@
 #if PROBE_ENABLE
 #define PROBE_PORT              AUXINPUT1_PORT
 #define PROBE_PIN               AUXINPUT1_PIN
-#endif
-
-#if PROBE2_ENABLE
-#define PROBE2_PORT             AUXINPUT2_PORT
-#define PROBE2_PIN              AUXINPUT2_PIN
 #endif
 
 /* EOF */

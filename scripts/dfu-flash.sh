@@ -6,7 +6,12 @@
 # verifies it by reading the flash back and comparing, then boots it.
 # Reversible: if verification fails it aborts WITHOUT booting.
 #
-# The device must be in DFU mode: hold the BOOT0 button while plugging in USB-C.
+# Entering DFU mode:
+#   - If grblHAL is already running, this script auto-enters DFU by sending the
+#     "$DFU" command over the USB-CDC serial port (no BOOT0 button needed).
+#   - Otherwise (restoring stock, or a non-responsive app) hold BOOT0 while
+#     plugging in USB-C, then run this script.
+#   - Set RTS1_NO_AUTODFU=1 to skip the serial auto-enter and require BOOT0.
 #
 set -euo pipefail
 
@@ -20,16 +25,48 @@ DFU="$(command -v dfu-util || true)"
 
 md5of() { md5 -q "$1" 2>/dev/null || md5sum "$1" | awk '{print $1}'; }
 
+dfu_present() { "$DFU" -l 2>/dev/null | grep -q "Found DFU"; }
+
+# Ask a running grblHAL to reboot into the ROM DFU bootloader by sending "$DFU"
+# over its USB-CDC serial port. Best-effort: returns non-zero if no port found.
+enter_dfu_via_serial() {
+  local sent=0 port
+  # macOS exposes the CDC ACM device as /dev/cu.usbmodem*; a DFU device does not.
+  for port in /dev/cu.usbmodem* /dev/cu.usbserial*; do
+    [ -e "$port" ] || continue
+    echo ">> Sending \$DFU to $port ..."
+    stty -f "$port" 115200 2>/dev/null || true
+    # $ is literal inside single quotes; printf renders the CRLF.
+    if printf '$DFU\r\n' > "$port" 2>/dev/null; then
+      sent=1
+    else
+      echo "   (port busy — a sender app likely has it open; close it, or type \$DFU there yourself)"
+    fi
+  done
+  [ "$sent" = 1 ]
+}
+
 echo "============================================================"
 echo " Flashing: $LABEL"
 echo " File:     $BIN  ($(wc -c < "$BIN" | tr -d ' ') bytes)"
 echo "============================================================"
 
-# --- require DFU mode ---
-if ! "$DFU" -l 2>/dev/null | grep -q "Found DFU"; then
+# --- ensure DFU mode (auto-enter from running grblHAL, else require BOOT0) ---
+if ! dfu_present; then
+  if [ "${RTS1_NO_AUTODFU:-0}" != 1 ] && enter_dfu_via_serial; then
+    echo ">> Waiting for the DFU bootloader to enumerate..."
+    for _ in $(seq 1 40); do        # up to ~20 s
+      dfu_present && break
+      sleep 0.5
+    done
+  fi
+fi
+
+if ! dfu_present; then
   echo
-  echo ">> Device is NOT in DFU mode."
+  echo ">> Device is NOT in DFU mode (auto-enter via \$DFU did not take)."
   echo ">> Hold the BOOT0 button while plugging in USB-C, then re-run this script."
+  echo ">>   (or unset RTS1_NO_AUTODFU if you set it)"
   exit 1
 fi
 echo ">> DFU device detected."
@@ -47,12 +84,23 @@ echo ">> Writing flash..."
 "$DFU" -a 0 -s ${ADDR} -D "$BIN" 2>&1 | grep -iE "download|done|success|error|fail" | tail -3
 
 # --- verify by read-back ---
+# Compare md5 of a clean read-back against the source. The first upload right
+# after a download can fail while the device settles (dfuDNLOAD-IDLE), so retry.
+# NOTE: do NOT pipe dfu-util into `grep -q` here — grep closes the pipe on match,
+# SIGPIPEs dfu-util mid-upload, and leaves a truncated read-back (false mismatch).
 echo ">> Verifying (reading flash back)..."
-RB="$(mktemp)"; trap 'rm -f "$RB"' EXIT
-"$DFU" -a 0 -s ${ADDR}:${IMG} -U "$RB" 2>&1 | grep -iE "upload done|error" | tail -1
-
-SRC="$(mktemp)"; head -c "$IMG" "$BIN" > "$SRC"
-SRC_MD5=$(md5of "$SRC"); RB_MD5=$(md5of "$RB"); rm -f "$SRC"
+RB="$(mktemp)"; SRC="$(mktemp)"; trap 'rm -f "$RB" "$SRC"' EXIT
+head -c "$IMG" "$BIN" > "$SRC"; SRC_MD5=$(md5of "$SRC")
+RB_MD5=""
+sleep 1
+for attempt in 1 2 3 4; do
+  rm -f "$RB"          # dfu-util -U refuses to overwrite an existing file
+  "$DFU" -a 0 -s ${ADDR}:${IMG} -U "$RB" >/dev/null 2>&1 || true
+  RB_MD5=$(md5of "$RB")
+  [ "$SRC_MD5" = "$RB_MD5" ] && break
+  echo "   read-back attempt $attempt didn't match yet; retrying..."
+  sleep 1
+done
 echo "   source: $SRC_MD5"
 echo "   device: $RB_MD5"
 if [ "$SRC_MD5" != "$RB_MD5" ]; then

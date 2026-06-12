@@ -7,5 +7,11 @@ __pycache__/
 .DS_Store
 
 # Note: firmware/*.bin ARE tracked on purpose — they're the project's key artifacts.
+# Upstream grblHAL tree fetched by grblhal-rts1/setup.sh (not committed; our board
+# files live in grblhal-rts1/boards/ and are copied in by setup.sh).
+grblhal-rts1/STM32F4xx/
 grblhal/STM32F4xx/.pio/
 grblhal/
+
+# Analysis convenience symlink to the stock dump (created for the capstone scripts)
+stock_RTS-1_backup.bin
