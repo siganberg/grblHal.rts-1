@@ -179,6 +179,61 @@ static void rts1_drv8452_init (void)
     }
 }
 
+// ======================= Diagnostics (logging + $DRV) =======================
+// RTS1_DIAG=1 streams e-stop/recovery events to the console and dumps the live
+// DRV8452 registers at boot + on every fault transition, and enables the "$DRV"
+// command (dump all five drivers' registers on demand). Set to 0 to ship quiet.
+#ifndef RTS1_DIAG
+#define RTS1_DIAG 1
+#endif
+
+static const char rts1_hexd[] = "0123456789ABCDEF";
+
+static void rts1_emit (const char *s) { if(hal.stream.write) hal.stream.write(s); }
+
+// Append "0xNN" for a byte into buf at *p.
+static void rts1_puthex (char *buf, uint8_t *p, uint8_t v)
+{
+    buf[(*p)++] = '0'; buf[(*p)++] = 'x';
+    buf[(*p)++] = rts1_hexd[(v >> 4) & 0xF];
+    buf[(*p)++] = rts1_hexd[v & 0xF];
+}
+
+// Read the key DRV8452 registers from all five drivers and stream them as
+// [MSG:DRVi ...] lines. On a no-config snapshot build this reads stock's LIVE
+// values; on this (configured) build it confirms our writes + the read path.
+static void rts1_dump_registers (void)
+{
+    static const struct { char nm[4]; uint8_t reg; } regs[] = {
+        {"F",  0x00}, {"C1", 0x04}, {"C2",  0x05}, {"C3",  0x06}, {"C5", 0x08},
+        {"C6", 0x09}, {"C10",0x0D}, {"C11", 0x0E}, {"C13", 0x10}
+    };
+    for(uint8_t i = 0; i < DRV_N; i++) {
+        char buf[128]; uint8_t p = 0;
+        const char *h = "[MSG:DRV"; while(*h) buf[p++] = *h++;
+        buf[p++] = (char)('0' + i);
+        for(uint8_t r = 0; r < sizeof(regs) / sizeof(regs[0]); r++) {
+            buf[p++] = ' ';
+            const char *nm = regs[r].nm; while(*nm) buf[p++] = *nm++;
+            buf[p++] = '=';
+            rts1_puthex(buf, &p, drv_read(i, regs[r].reg));
+        }
+        buf[p++] = ']'; buf[p++] = '\r'; buf[p++] = '\n'; buf[p] = '\0';
+        rts1_emit(buf);
+    }
+}
+
+static on_unknown_sys_command_ptr rts1_on_sys_command = NULL;
+
+static status_code_t rts1_sys_command (sys_state_t state, char *line)
+{
+    if(!strcmp(line, "DRV")) {                       // "$DRV": dump driver regs
+        rts1_dump_registers();
+        return Status_OK;
+    }
+    return rts1_on_sys_command ? rts1_on_sys_command(state, line) : Status_Unhandled;
+}
+
 // =================== E-stop: motor-power (VM) loss monitor ===================
 // The board's e-stop cuts MOTOR POWER (VM); there is no e-stop signal wire. The
 // DRV8452 reports VM undervoltage in its FAULT register (0x00 bit5 = UVLO),
@@ -202,55 +257,104 @@ static control_signals_t rts1_control_get_state (void)
     return s;
 }
 
-// Single-pass driver config (NO read-back verify - reads return the status byte,
-// not the register value, so a verify is meaningless and just blocks the loop).
-static void drv_write_config (uint8_t i)
+// Recover the drivers after a VM-UVLO event (or a brown-out reboot with VM back):
+// pulse PC15 (nSLEEP) to reset the DRV8452s, then re-config with READ-BACK VERIFY
+// + retry per driver (reads are confirmed working via $DRV), so a dropped frame on
+// the just-woken interface can't leave a driver silently disabled. Logs the post-
+// recovery CTRL1 (expect 0x8F = EN_OUT on) + FAULT (expect 0x00) so the console
+// proves whether the motors actually re-grabbed.
+// Returns true only if ALL drivers verified re-enabled (CTRL1 = 0x8F, no fault).
+static bool rts1_recover_drivers (void)
 {
-    drv_write(i, 0x06, 0x3C | 0x80);            // CTRL3 + CLR_FLT
-    drv_write(i, 0x10, 0xFE);                   // CTRL13: VREF_INT_EN
-    drv_write(i, 0x06, 0x3C);                   // CTRL3
-    drv_write(i, 0x04, 0x0F);                   // CTRL1: EN_OUT=0
-    drv_write(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2
-    drv_write(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11
-    drv_write(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10
-    drv_write(i, 0x04, 0x0F | 0x80);            // CTRL1: EN_OUT=1
+    bool all_ok = true;
+    rts1_drv_reset_pulse();                                  // PC15 low->high reset (like stock)
+    for(uint8_t i = 0; i < DRV_N; i++) {
+        bool ok = false;
+        for(uint8_t t = 0; t < 4 && !ok; t++)
+            ok = drv_configure(i);                           // verified write + retry
+        all_ok &= ok;
+#if RTS1_DIAG
+        uint8_t c1 = drv_read(i, 0x04), f = drv_read(i, DRV_FAULT_REG);
+        char b[80]; uint8_t p = 0;
+        const char *h = "[MSG:RTS1 recov DRV"; while(*h) b[p++] = *h++;
+        b[p++] = (char)('0' + i);
+        const char *st = ok ? " OK" : " FAIL"; while(*st) b[p++] = *st++;
+        const char *cc = " C1="; while(*cc) b[p++] = *cc++; rts1_puthex(b, &p, c1);
+        const char *ff = " F=";  while(*ff) b[p++] = *ff++; rts1_puthex(b, &p, f);
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
+#endif
+    }
+    return all_ok;
 }
 
-// Recover the drivers after a VM-UVLO event: pulse PC15 (nSLEEP) to reset the
-// DRV8452s, flush the SPI (drivers' interface just woke), then re-config (fast,
-// non-blocking single pass).
-static void rts1_recover_drivers (void)
+// Emit "[MSG:RTS1 <tag>=0xNN]".
+static void rts1_log_byte (const char *tag, uint8_t v)
 {
-    rts1_drv_reset_pulse();                                  // PC15 low->high reset (like stock)
-    for(uint8_t i = 0; i < DRV_N; i++)                       // straight to config (no flush, like stock)
-        drv_write_config(i);
+    char b[64]; uint8_t p = 0;
+    const char *h = "[MSG:RTS1 "; while(*h) b[p++] = *h++;
+    while(*tag) b[p++] = *tag++;
+    b[p++] = '=';
+    rts1_puthex(b, &p, v);
+    b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+    rts1_emit(b);
 }
 
 static void rts1_realtime (sys_state_t state)
 {
-    static uint8_t vm_ok = 0;
     uint32_t now = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
+
+#if RTS1_DIAG
+    static bool booted = false;                     // one-shot boot dump (stream up)
+    if(!booted && now > 2500) {
+        booted = true;
+        rts1_emit("[MSG:RTS1 diag build - $DRV dumps driver regs; e-stop logged]" ASCII_EOL);
+        rts1_dump_registers();
+    }
+#endif
+
     if(now - rts1_poll_last >= 100) {               // poll VM ~10 Hz
         rts1_poll_last = now;
         if(!rts1_vm_fault) {
             // Healthy: a set UVLO bit means VM just dropped -> e-stop (halt+alarm).
-            if(drv_read(0, DRV_FAULT_REG) & DRV_UVLO_BIT) {
+            uint8_t fault = drv_read(0, DRV_FAULT_REG);
+            if(fault & DRV_UVLO_BIT) {
                 rts1_vm_fault = true;
-                vm_ok = 0;
+#if RTS1_DIAG
+                rts1_log_byte("VM-LOST fault", fault);
+#endif
                 hal.control.interrupt_callback(rts1_control_get_state());
             }
         } else {
-            // Faulted: UVLO LATCHES, so clear it then re-read - re-asserts only if
-            // VM is genuinely still low. Cleared & stable => VM is back: power-cycle
-            // the drivers + reconfigure, then release the e-stop (no MCU reboot).
-            drv_write(0, 0x06, 0x3C | 0x80);            // CLR_FLT (driver 0)
-            if(drv_read(0, DRV_FAULT_REG) & DRV_UVLO_BIT)
-                vm_ok = 0;                               // VM still low
-            else if(++vm_ok >= 3) {                      // back & stable ~300 ms
-                vm_ok = 0;
-                rts1_recover_drivers();
-                rts1_vm_fault = false;
-                hal.control.interrupt_callback(rts1_control_get_state());
+            // Faulted (VM lost). The e-stop cuts the DRIVERS' logic supply too, so
+            // while it is held the DRV8452s are fully dark and every SPI read returns
+            // 0x00 - which is NOT a real "no fault", just an unpowered chip. So the
+            // FAULT register is untrustworthy here. Instead probe LIVENESS: write a
+            // sentinel (CTRL3=0x3C, our normal value) and read it back - only a
+            // powered chip echoes it. While dark we wait quietly (no PC15 pulse, no
+            // spam). Once the chip is alive again (VM restored) and stable, do one
+            // verified recovery and release the e-stop only when all outputs confirm
+            // back on (CTRL1=0x8F); otherwise keep retrying.
+            static uint8_t vm_back = 0;
+
+            drv_write(0, 0x06, 0x3C);                   // liveness sentinel (= our CTRL3)
+            if(drv_read(0, 0x06) != 0x3C) {
+                vm_back = 0;                            // chip dark -> VM still down, wait
+            } else if(++vm_back >= 3) {                 // chip alive & stable ~300 ms
+                vm_back = 0;
+#if RTS1_DIAG
+                rts1_emit("[MSG:RTS1 VM back - recovering]" ASCII_EOL);
+#endif
+                if(rts1_recover_drivers()) {            // verified: every EN_OUT back on
+                    rts1_vm_fault = false;
+#if RTS1_DIAG
+                    rts1_emit("[MSG:RTS1 VM RESTORED - motors re-enabled]" ASCII_EOL);
+#endif
+                    hal.control.interrupt_callback(rts1_control_get_state());
+                }
+#if RTS1_DIAG
+                else rts1_emit("[MSG:RTS1 recovery incomplete - retrying]" ASCII_EOL);
+#endif
             }
         }
     }
@@ -267,6 +371,9 @@ static void rts1_estop_init (void)
 
     rts1_on_realtime = grbl.on_execute_realtime;
     grbl.on_execute_realtime = rts1_realtime;
+
+    rts1_on_sys_command = grbl.on_unknown_sys_command;   // "$DRV" register dump
+    grbl.on_unknown_sys_command = rts1_sys_command;
 
     rts1_poll_last = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
 }

@@ -48,22 +48,27 @@ At 0xC0 (~2.1 A, below stock's 2.8 A) X/Y still cut out after ~9 min. Stock runs
 NEXT: confirm thermal (feel X/Y chips after a dropout; check both fans), then RE
 how stock drives the fans (we just hold PB15/PC15 high; stock may PWM/run harder).
 
-### E-STOP (motor-power monitor) - detection WORKS, auto-recovery UNSOLVED
-rts1.c polls the DRV8452 FAULT reg (0x00, bit5 UVLO) over SPI ~10 Hz:
-- **VM lost -> grblHAL e_stop alarm: WORKS** (verified via ncSender log).
-- **STOCK auto-recovers seamlessly** (confirmed by restoring v1.5.9 + RealTimeCNC
-  sender): release e-stop -> ~1 s -> motors re-energize, position RETAINED, no
-  unlock. So seamless recovery IS firmware-doable - we just haven't matched it yet.
-- RE of stock recovery (init @0x0800D7E4 -> per-driver @0x0801FF28): on VM-return
-  it pulses **PC15 LOW 1 ms -> HIGH 2 ms** (PC15 = DRV8452 nSLEEP/reset) then
-  re-runs per-driver config. We now do the same (`rts1_recover_drivers` /
-  `rts1_drv_reset_pulse`) yet motors still don't re-grab. Stock's per-driver config
-  values are **data-driven** (RAM struct, not code immediates) so the exact bytes
-  can't be pulled statically. Also: our register READS return the DRV8452 *status*
-  byte (not the reg value), so read-back verify is meaningless (writes still work).
-- **DEFINITIVE NEXT STEP: logic-analyzer capture** of SPI (PA5=SCK, PA7=MOSI, PC15,
-  PC0 CS) during a stock e-stop recovery -> exact byte sequence to replicate (and
-  the exact TRQ_DAC for 2.8 A, which also settles the current/thermal question).
+### E-STOP (motor-power monitor) - SOLVED (detection + auto-recovery both work)
+rts1.c polls the DRV8452 over SPI ~10 Hz (`rts1_realtime` in boards/rts1.c):
+- **VM lost -> grblHAL e_stop alarm: WORKS** (FAULT reg 0x00 bit5 UVLO = 0xA0).
+- **Auto-recovery now WORKS**: release e-stop -> motors re-energize on their own,
+  no MCU reboot, then click reset to clear the alarm. Confirmed over many cycles +
+  boot-order (connect USB first, then turn on PSU -> motors power). Matches stock feel.
+- **KEY INSIGHT that cracked it**: the e-stop cuts the DRV8452 **logic/VCC supply too**
+  (not just motor VM). While e-stop is held the driver chips are **fully dark** and
+  every SPI read returns **0x00** - which looks like "no fault" but is just an
+  unpowered chip. The old recovery trusted the FAULT reg, saw 0x00, tried to
+  reconfigure dead chips, and silently "succeeded" into nothing.
+- **The fix** (`rts1_realtime` faulted branch): don't trust FAULT while dark. Probe
+  **liveness** - write a sentinel (CTRL3=0x3C) and read it back; only a powered chip
+  echoes it. While dark, wait quietly. Once the chip is alive + stable (~300 ms), run
+  `rts1_recover_drivers` = PC15 reset pulse + **verified** per-driver config (read-back
+  CTRL1==0x8F), and release the e-stop ONLY when all 5 verify EN_OUT on; else retry.
+- **Register READS DO work** (earlier "reads return status byte" was wrong). Proven by
+  `$DRV` (dumps all 5 drivers' regs). This made read-back verify + the liveness probe
+  + the snapshot idea all viable - no logic analyzer needed after all.
+- **`$DRV` console command**: dumps F/C1/C2/C3/C5/C6/C10/C11/C13 for all 5 drivers.
+  Gated with the rest of the diagnostics behind `RTS1_DIAG` (boards/rts1.c, =1 now).
 - ncSender debug-log dir: `~/Library/Application Support/ncSender/logs/`.
 
 NEXT (besides e-stop + thermal):
@@ -71,6 +76,23 @@ NEXT (besides e-stop + thermal):
 2. **Axis direction/mapping**: $3=4 (Z), $8=0 (Y2 ganged) are baked defaults. Verify
    each axis jogs correct way + correct motor. ($8 was 2, set to 0 per bring-up.)
 3. **Run `$RST=$`** after flashing to load compiled defaults (NVS keeps old else).
+
+## BUILD GOTCHA - boards/rts1.c exists in TWO places (sync before building!)
+`grblhal-rts1/boards/rts1.c` is the tracked SOURCE; `setup.sh` copies it to
+`grblhal-rts1/STM32F4xx/boards/rts1.c` (gitignored) which is what `pio run` actually
+compiles. **Editing the source alone does NOT reach the build** - it silently uses the
+stale copy (flash verifies OK but new behavior is absent). After editing, re-sync:
+`cp grblhal-rts1/boards/rts1.c grblhal-rts1/STM32F4xx/boards/rts1.c` (or re-run setup.sh),
+then verify: `strings .pio/build/RTS1/firmware.elf | grep <new-string>`. (Same for rts1_map.h.)
+
+## Quieter drivers (open) - RE answered the "how", needs stock's CTRL5/CTRL6 bytes
+Disassembly (both v1.4.7 + v1.5.9, identical) shows our DRV8452 config already MATCHES
+stock for CTRL13=0xFE, CTRL3=0x3C, CTRL1=0x0F->0x8F, CTRL2=0x06 (1/16). Stock does NOT
+touch CTRL4/7/8/9 (no secret decay register). The only gap: stock writes a per-driver
+**CTRL5/CTRL6** stall/"SmartTune" value (we leave them at reset defaults 0x03/0x20, seen
+via `$DRV`). That + stock's higher current (2.8 A vs our 2.1 A) is the sound difference.
+Run/hold current (CTRL11/CTRL10) + CTRL5/6 are host-supplied bytes (no amps formula in fw)
+-> get them via the **snapshot** (no-config build + `$DRV` reads stock's live values).
 
 ## Flashing (now bullet-proof + fast, `scripts/`)
 `flash-grblhal.sh` auto-enters DFU with no BOOT0: it closes whatever app holds the
