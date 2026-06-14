@@ -30,37 +30,44 @@ Motors energize/hold/jog. `board_init()` (`grblhal-rts1/boards/rts1.c`) now:
   verify + retry per driver (a dropped frame was leaving a driver dark).
 Current is `RTS1_DRV_RUN_CURRENT` / `RTS1_DRV_HOLD_CURRENT` in rts1.c (tune there).
 
-Since then (all in rts1.c): microstep now **1/32** (was 1/16 — fixes low-speed
-resonance / "harmonic" noise); each driver's config registers are read-back
-verified (a garbled current/decay frame made a driver run loud / fault); spindle
-is all-VFD + a quiet **on/off default** (NOT PWM — PA0's timers TIM5/TIM2 are the
-grblHAL stepper/RPM timers, so a PA0 PWM spindle hangs boot). Y2 "violent rattle"
-turned out to be a **bad Y2 motor connector** (wiring), now fixed.
+### Settings now MATCH STOCK (from RealTimeCNC config UI), in env + rts1.c
+- Microstep **1/16** (the "resonance" was a bad Y2 connector, since fixed). CTRL2=0x06.
+- **Steps/mm = stock "Stepper Resolution" x 16** (UI value is FULL-STEP res):
+  X=20x16=**320**, Y=**320**, Z=50x16=**800**. Verified 100 mm ~= 100 mm.
+  (Cross-check: 5715 mm/min x 320 / 60 = 30.5 kHz = UI "Max Step Rate". ✓)
+- Travel 420/420/110, max rate 5715/5715/3000 mm/min, accel 208 mm/sec^2
+  (=750000 mm/min^2), Z reversed ($3=4), $8=0 — all DEFAULT_* in the env.
+- **Current**: DRV8452 PWP pkg = 4 A full-scale = **2.8 A RMS = TRQ_DAC 0xFF**.
+  We use RUN=0xC0 (~2.1 A) / HOLD=0x40 in rts1.c (0xFF tripped OCP on X/Y).
+- spindle: all-VFD + quiet **on/off default** (NOT PWM - PA0's timers TIM5/TIM2 are
+  grblHAL's stepper/RPM timers, so a PA0 PWM spindle hangs boot).
 
-### E-STOP (motor-power monitor) — IN PROGRESS, recovery UNTESTED/UNSOLVED
-rts1.c polls the DRV8452 **FAULT reg (0x00, bit5 UVLO)** over SPI ~10 Hz:
-- **VM lost → grblHAL e_stop alarm: WORKS** (verified via ncSender log).
-- **VM restored → re-power motors: NOT working yet.** Hard finding from debug logs:
-  after a VM-UVLO event the DRV8452s get **stuck** — neither an in-place SPI
-  reconfigure NOR a full `NVIC_SystemReset()` (re-running board_init) re-enables
-  them (every CTRLx reads back 0x00). Only a real driver power-cycle recovers.
-  - Dropped the reboot idea (caused a USB disconnect, user disliked it, and it
-    didn't work anyway; also broke e-stop re-detection).
-  - **Current attempt (untested):** on VM-return, pulse the driver power/enable
-    straps **PC15+PB15 low→high (~50 ms)** to hardware-reset the DRV8452s, then
-    re-run the SPI config. See `rts1_recover_drivers()`.
-  - If the strap-cycle doesn't recover them: options are (a) recovery = full
-    controller power-cycle (document as the e-stop reset procedure), or (b) RE the
-    **stock firmware's** e-stop recovery sequence (it must do something specific —
-    nSLEEP pulse? specific SPI reg?). The VM voltage is also on ADC PA1/PA4 if a
-    cleaner sense is wanted.
-- **Test next session (PSU on):** boot Idle+holding; press e-stop → Alarm/e_stop;
-  release → do the motors re-grab? does re-pressing e-stop re-alarm? Watch the
-  ncSender log (`~/Library/Application Support/ncSender/logs/`).
+### KNOWN ISSUE - X/Y thermal dropout under sustained running
+At 0xC0 (~2.1 A, below stock's 2.8 A) X/Y still cut out after ~9 min. Stock runs
+2.8 A for hours, so the difference is likely **cooling** (fan drive) not current.
+NEXT: confirm thermal (feel X/Y chips after a dropout; check both fans), then RE
+how stock drives the fans (we just hold PB15/PC15 high; stock may PWM/run harder).
 
-NEXT (besides e-stop):
-1. **Steps/mm calibration** ($100–$103): NOW 1/32 microstep — recompute (≈2× the
-   1/16 values) or measure a known move.
+### E-STOP (motor-power monitor) - detection WORKS, auto-recovery UNSOLVED
+rts1.c polls the DRV8452 FAULT reg (0x00, bit5 UVLO) over SPI ~10 Hz:
+- **VM lost -> grblHAL e_stop alarm: WORKS** (verified via ncSender log).
+- **STOCK auto-recovers seamlessly** (confirmed by restoring v1.5.9 + RealTimeCNC
+  sender): release e-stop -> ~1 s -> motors re-energize, position RETAINED, no
+  unlock. So seamless recovery IS firmware-doable - we just haven't matched it yet.
+- RE of stock recovery (init @0x0800D7E4 -> per-driver @0x0801FF28): on VM-return
+  it pulses **PC15 LOW 1 ms -> HIGH 2 ms** (PC15 = DRV8452 nSLEEP/reset) then
+  re-runs per-driver config. We now do the same (`rts1_recover_drivers` /
+  `rts1_drv_reset_pulse`) yet motors still don't re-grab. Stock's per-driver config
+  values are **data-driven** (RAM struct, not code immediates) so the exact bytes
+  can't be pulled statically. Also: our register READS return the DRV8452 *status*
+  byte (not the reg value), so read-back verify is meaningless (writes still work).
+- **DEFINITIVE NEXT STEP: logic-analyzer capture** of SPI (PA5=SCK, PA7=MOSI, PC15,
+  PC0 CS) during a stock e-stop recovery -> exact byte sequence to replicate (and
+  the exact TRQ_DAC for 2.8 A, which also settles the current/thermal question).
+- ncSender debug-log dir: `~/Library/Application Support/ncSender/logs/`.
+
+NEXT (besides e-stop + thermal):
+1. **Steps/mm: DONE** (320/320/800, verified 100 mm). Fine-tune microns later.
 2. **Axis direction/mapping**: $3=4 (Z), $8=0 (Y2 ganged) are baked defaults. Verify
    each axis jogs correct way + correct motor. ($8 was 2, set to 0 per bring-up.)
 3. **Run `$RST=$`** after flashing to load compiled defaults (NVS keeps old else).

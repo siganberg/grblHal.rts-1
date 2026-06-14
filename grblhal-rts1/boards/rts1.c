@@ -33,11 +33,13 @@
 // ---- DRV8452 current settings (CTRL10/CTRL11 DAC codes, 0..255; 255 = full
 // scale). Conservative bring-up defaults - raise toward 0xFF for more torque.
 // Motors are rated 2.8 A RMS/driver; full scale corresponds to that. ----
-#define RTS1_DRV_RUN_CURRENT   0xC0   // CTRL11 TRQ_DAC (move) ~75% (~2.1A)
-#define RTS1_DRV_HOLD_CURRENT  0x60   // CTRL10 ISTSL  (idle) ~37% (cooler hold)
-#define RTS1_DRV_MICROSTEP     0x07   // CTRL2 low nibble: 0x07 = 1/32 step (0x06=1/16)
-                                      // higher microstep -> less resonance/noise.
-                                      // NOTE: steps/mm ($100-103) must scale with this!
+// Stock RTS-1 target: run 2.8 A, hold 0.75 A, 1/16 microstep. The TRQ_DAC->amps
+// mapping (board full-scale) is unknown; 0xFF over-drove the motors (overcurrent
+// dropout on X/Y1), so use 0xC0 which was stable. Tune once a scope/logic-analyzer
+// confirms the exact value stock writes for 2.8 A.
+#define RTS1_DRV_RUN_CURRENT   0xC0   // CTRL11 TRQ_DAC (move)  ~2.8 A target (stable)
+#define RTS1_DRV_HOLD_CURRENT  0x40   // CTRL10 ISTSL  (idle)   ~0.75 A target
+#define RTS1_DRV_MICROSTEP     0x06   // CTRL2 low nibble: 0x06 = 1/16 (stock); $100-102 = 320/320/800
 
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
@@ -109,6 +111,21 @@ static bool drv_configure (uint8_t i)
     return ok;
 }
 
+static void rts1_busywait (uint32_t loops) { while(loops--) __NOP(); }
+
+// Stock resets the DRV8452s by pulsing PC15 (the driver reset/enable strap) LOW
+// then HIGH before SPI config (RE: config routine @0x0800D7E4 does PC15=0; delay
+// 1 ms; PC15=1). A steady-high PC15 works at cold boot, but a driver stuck after
+// a VM-UVLO event ONLY recovers via this LOW->HIGH pulse - which is why even an
+// MCU reboot (PC15 re-driven high, never pulsed low) failed to recover it.
+static void rts1_drv_reset_pulse (void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);   // assert reset
+    rts1_busywait(90000);                                    // ~1 ms low (matches stock)
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);     // release
+    rts1_busywait(180000);                                   // ~2 ms settle (matches stock)
+}
+
 static void rts1_drv8452_init (void)
 {
     // SPI1 GPIO: PA5=SCK, PA6=MISO, PA7=MOSI, AF5.
@@ -148,6 +165,10 @@ static void rts1_drv8452_init (void)
     (void)spi_xfer(0xFF);
     (void)spi_xfer(0xFF);
 
+    // Reset the drivers (PC15 pulse) before configuring - matches stock and is
+    // what lets a UVLO-stuck driver recover.
+    rts1_drv_reset_pulse();
+
     // Configure + enable all five drivers, with read-back verification + retry
     // so a single dropped SPI frame can't leave a driver silently disabled.
     for(uint8_t i = 0; i < DRV_N; i++) {
@@ -181,22 +202,28 @@ static control_signals_t rts1_control_get_state (void)
     return s;
 }
 
-static void rts1_busywait (uint32_t loops) { while(loops--) __NOP(); }
+// Single-pass driver config (NO read-back verify - reads return the status byte,
+// not the register value, so a verify is meaningless and just blocks the loop).
+static void drv_write_config (uint8_t i)
+{
+    drv_write(i, 0x06, 0x3C | 0x80);            // CTRL3 + CLR_FLT
+    drv_write(i, 0x10, 0xFE);                   // CTRL13: VREF_INT_EN
+    drv_write(i, 0x06, 0x3C);                   // CTRL3
+    drv_write(i, 0x04, 0x0F);                   // CTRL1: EN_OUT=0
+    drv_write(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2
+    drv_write(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11
+    drv_write(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10
+    drv_write(i, 0x04, 0x0F | 0x80);            // CTRL1: EN_OUT=1
+}
 
-// Recover the drivers after a VM-UVLO event: an SPI reconfigure alone won't
-// re-enable them, so first HARDWARE-cycle their enable/power straps (PC15/PB15
-// low->high resets the DRV8452 stage), then re-run the SPI config.
+// Recover the drivers after a VM-UVLO event: pulse PC15 (nSLEEP) to reset the
+// DRV8452s, flush the SPI (drivers' interface just woke), then re-config (fast,
+// non-blocking single pass).
 static void rts1_recover_drivers (void)
 {
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);   // straps low = drivers off
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
-    rts1_busywait(1500000);                                  // ~50 ms off
-    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);     // straps high = drivers on
-    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-    rts1_busywait(1500000);                                  // ~50 ms settle
-    for(uint8_t i = 0; i < DRV_N; i++)                       // re-config over SPI
-        for(uint8_t t = 0; t < 4 && !drv_configure(i); t++)
-            ;
+    rts1_drv_reset_pulse();                                  // PC15 low->high reset (like stock)
+    for(uint8_t i = 0; i < DRV_N; i++)                       // straight to config (no flush, like stock)
+        drv_write_config(i);
 }
 
 static void rts1_realtime (sys_state_t state)
