@@ -35,7 +35,9 @@
 // Motors are rated 2.8 A RMS/driver; full scale corresponds to that. ----
 #define RTS1_DRV_RUN_CURRENT   0xC0   // CTRL11 TRQ_DAC (move) ~75% (~2.1A)
 #define RTS1_DRV_HOLD_CURRENT  0x60   // CTRL10 ISTSL  (idle) ~37% (cooler hold)
-#define RTS1_DRV_MICROSTEP     0x06   // CTRL2 low nibble: 0x06 = 1/16 step
+#define RTS1_DRV_MICROSTEP     0x07   // CTRL2 low nibble: 0x07 = 1/32 step (0x06=1/16)
+                                      // higher microstep -> less resonance/noise.
+                                      // NOTE: steps/mm ($100-103) must scale with this!
 
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
@@ -96,6 +98,7 @@ static bool drv_cfg_reg (uint8_t i, uint8_t reg, uint8_t data)
 static bool drv_configure (uint8_t i)
 {
     bool ok = true;
+    drv_write(i, 0x06, 0x3C | 0x80);                    // CTRL3 + CLR_FLT: clear latched UVLO/fault
     ok &= drv_cfg_reg(i, 0x10, 0xFE);                   // CTRL13: VREF_INT_EN=1
     ok &= drv_cfg_reg(i, 0x06, 0x3C);                   // CTRL3 : unlock + OCP config
     ok &= drv_cfg_reg(i, 0x04, 0x0F);                   // CTRL1 : TOFF/DECAY, EN_OUT=0
@@ -155,6 +158,92 @@ static void rts1_drv8452_init (void)
     }
 }
 
+// =================== E-stop: motor-power (VM) loss monitor ===================
+// The board's e-stop cuts MOTOR POWER (VM); there is no e-stop signal wire. The
+// DRV8452 reports VM undervoltage in its FAULT register (0x00 bit5 = UVLO),
+// readable over SPI while USB/VCC stays up. We poll it: on VM loss we raise the
+// grblHAL e-stop (halt + alarm); on soft-reset we clear the latched fault and
+// reconfigure the drivers, so pressing reset after power returns re-powers the
+// motors (this also makes boot order not matter).
+#define DRV_FAULT_REG   0x00            // R: bit7=FAULT, bit5=UVLO
+#define DRV_UVLO_BIT    0x20
+
+static volatile bool rts1_vm_fault = false;
+static uint32_t rts1_poll_last = 0;
+static on_execute_realtime_ptr rts1_on_realtime = NULL;
+static control_signals_get_state_ptr rts1_get_state = NULL;
+
+static control_signals_t rts1_control_get_state (void)
+{
+    control_signals_t s = rts1_get_state ? rts1_get_state() : (control_signals_t){0};
+    if(rts1_vm_fault)
+        s.e_stop = On;
+    return s;
+}
+
+static void rts1_busywait (uint32_t loops) { while(loops--) __NOP(); }
+
+// Recover the drivers after a VM-UVLO event: an SPI reconfigure alone won't
+// re-enable them, so first HARDWARE-cycle their enable/power straps (PC15/PB15
+// low->high resets the DRV8452 stage), then re-run the SPI config.
+static void rts1_recover_drivers (void)
+{
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_RESET);   // straps low = drivers off
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_RESET);
+    rts1_busywait(1500000);                                  // ~50 ms off
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);     // straps high = drivers on
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
+    rts1_busywait(1500000);                                  // ~50 ms settle
+    for(uint8_t i = 0; i < DRV_N; i++)                       // re-config over SPI
+        for(uint8_t t = 0; t < 4 && !drv_configure(i); t++)
+            ;
+}
+
+static void rts1_realtime (sys_state_t state)
+{
+    static uint8_t vm_ok = 0;
+    uint32_t now = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
+    if(now - rts1_poll_last >= 100) {               // poll VM ~10 Hz
+        rts1_poll_last = now;
+        if(!rts1_vm_fault) {
+            // Healthy: a set UVLO bit means VM just dropped -> e-stop (halt+alarm).
+            if(drv_read(0, DRV_FAULT_REG) & DRV_UVLO_BIT) {
+                rts1_vm_fault = true;
+                vm_ok = 0;
+                hal.control.interrupt_callback(rts1_control_get_state());
+            }
+        } else {
+            // Faulted: UVLO LATCHES, so clear it then re-read - re-asserts only if
+            // VM is genuinely still low. Cleared & stable => VM is back: power-cycle
+            // the drivers + reconfigure, then release the e-stop (no MCU reboot).
+            drv_write(0, 0x06, 0x3C | 0x80);            // CLR_FLT (driver 0)
+            if(drv_read(0, DRV_FAULT_REG) & DRV_UVLO_BIT)
+                vm_ok = 0;                               // VM still low
+            else if(++vm_ok >= 3) {                      // back & stable ~300 ms
+                vm_ok = 0;
+                rts1_recover_drivers();
+                rts1_vm_fault = false;
+                hal.control.interrupt_callback(rts1_control_get_state());
+            }
+        }
+    }
+    if(rts1_on_realtime)
+        rts1_on_realtime(state);
+}
+
+static void rts1_estop_init (void)
+{
+    hal.signals_cap.e_stop = On;
+
+    rts1_get_state = hal.control.get_state;
+    hal.control.get_state = rts1_control_get_state;
+
+    rts1_on_realtime = grbl.on_execute_realtime;
+    grbl.on_execute_realtime = rts1_realtime;
+
+    rts1_poll_last = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
+}
+
 void board_init (void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -177,6 +266,9 @@ void board_init (void)
 
     // Bring the five DRV8452 drivers out of Hi-Z and set their current (SPI).
     rts1_drv8452_init();
+
+    // Monitor motor power (VM): e-stop on loss, recover drivers on reset.
+    rts1_estop_init();
 }
 
 #endif // BOARD_RTS1

@@ -56,9 +56,16 @@ enter_dfu_via_serial() {
     [ -e "$port" ] || continue
     free_port "$port"                            # close ncSender/gSender if it holds it
     echo ">> Sending \$DFU to $port ..."
-    stty -f "$port" 115200 2>/dev/null || true
-    # $ is literal inside single quotes; printf renders the CRLF.
-    if printf '$DFU\r\n' > "$port" 2>/dev/null; then
+    stty -f "$port" 115200 -hupcl 2>/dev/null || true
+    # Hold the port open on fd 9 while writing: a bare '> port' redirect opens and
+    # closes too fast and grblHAL drops the line. Leading CRLF flushes any partial
+    # line first. ($ is literal in single quotes; printf renders the CRLFs.)
+    if exec 9<>"$port" 2>/dev/null; then
+      printf '\r\n$DFU\r\n' >&9
+      sleep 0.3
+      exec 9>&- 2>/dev/null || true
+      sent=1
+    elif printf '\r\n$DFU\r\n' > "$port" 2>/dev/null; then
       sent=1
     else
       echo "   (port still busy — close the sender app manually, or type \$DFU there)"
@@ -73,14 +80,15 @@ echo " File:     $BIN  ($(wc -c < "$BIN" | tr -d ' ') bytes)"
 echo "============================================================"
 
 # --- ensure DFU mode (auto-enter from running grblHAL, else require BOOT0) ---
-if ! dfu_present; then
-  if [ "${RTS1_NO_AUTODFU:-0}" != 1 ] && enter_dfu_via_serial; then
-    echo ">> Waiting for the DFU bootloader to enumerate..."
-    for _ in $(seq 1 40); do        # up to ~20 s
-      dfu_present && break
-      sleep 0.5
+if ! dfu_present && [ "${RTS1_NO_AUTODFU:-0}" != 1 ]; then
+  for try in 1 2 3; do              # re-send $DFU a few times in case it's dropped
+    enter_dfu_via_serial || break   # no serial port -> nothing to do
+    for _ in $(seq 1 15); do        # ~4.5 s for the bootloader to come up
+      dfu_present && break 2
+      sleep 0.3
     done
-  fi
+    echo ">> \$DFU didn't take (try $try); retrying..."
+  done
 fi
 
 if ! dfu_present; then
@@ -109,26 +117,28 @@ echo ">> Writing flash..."
 # after a download can fail while the device settles (dfuDNLOAD-IDLE), so retry.
 # NOTE: do NOT pipe dfu-util into `grep -q` here — grep closes the pipe on match,
 # SIGPIPEs dfu-util mid-upload, and leaves a truncated read-back (false mismatch).
-echo ">> Verifying (reading flash back)..."
-RB="$(mktemp)"; SRC="$(mktemp)"; trap 'rm -f "$RB" "$SRC"' EXIT
-head -c "$IMG" "$BIN" > "$SRC"; SRC_MD5=$(md5of "$SRC")
-RB_MD5=""
-sleep 1
-for attempt in 1 2 3 4; do
-  rm -f "$RB"          # dfu-util -U refuses to overwrite an existing file
-  "$DFU" -a 0 -s ${ADDR}:${IMG} -U "$RB" >/dev/null 2>&1 || true
-  RB_MD5=$(md5of "$RB")
-  [ "$SRC_MD5" = "$RB_MD5" ] && break
-  echo "   read-back attempt $attempt didn't match yet; retrying..."
-  sleep 1
-done
-echo "   source: $SRC_MD5"
-echo "   device: $RB_MD5"
-if [ "$SRC_MD5" != "$RB_MD5" ]; then
-  echo "   ❌ VERIFY FAILED — flash does not match. NOT booting; please re-flash."
-  exit 1
+if [ "${RTS1_FAST:-0}" = 1 ]; then
+  echo ">> RTS1_FAST=1: skipping read-back verify (trusting dfu-util download)."
+else
+  echo ">> Verifying (reading flash back)..."
+  RB="$(mktemp)"; SRC="$(mktemp)"; trap 'rm -f "$RB" "$SRC"' EXIT
+  head -c "$IMG" "$BIN" > "$SRC"; SRC_MD5=$(md5of "$SRC")
+  RB_MD5=""
+  for attempt in 1 2 3; do
+    rm -f "$RB"          # dfu-util -U refuses to overwrite an existing file
+    "$DFU" -a 0 -s ${ADDR}:${IMG} -U "$RB" >/dev/null 2>&1 || true
+    RB_MD5=$(md5of "$RB")
+    [ "$SRC_MD5" = "$RB_MD5" ] && break
+    sleep 0.3
+  done
+  echo "   source: $SRC_MD5"
+  echo "   device: $RB_MD5"
+  if [ "$SRC_MD5" != "$RB_MD5" ]; then
+    echo "   ❌ VERIFY FAILED — flash does not match. NOT booting; please re-flash."
+    exit 1
+  fi
+  echo "   ✅ verified byte-for-byte."
 fi
-echo "   ✅ verified byte-for-byte."
 
 # --- boot the firmware (leave DFU) ---
 echo ">> Booting firmware (leaving DFU)..."

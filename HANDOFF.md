@@ -30,16 +30,46 @@ Motors energize/hold/jog. `board_init()` (`grblhal-rts1/boards/rts1.c`) now:
   verify + retry per driver (a dropped frame was leaving a driver dark).
 Current is `RTS1_DRV_RUN_CURRENT` / `RTS1_DRV_HOLD_CURRENT` in rts1.c (tune there).
 
-NEXT:
-1. **Steps/mm calibration** ($100–$103): drivers are at 1/16 microstep. Command a
-   known distance, measure, adjust.
-2. **Axis direction/mapping**: Z dir + Y2 ganged dir are now baked as defaults
-   ($3=4, $8=2). Verify X/Y/Z/A each jog the correct way + correct motor.
-3. **Run `$RST=$`** after flashing to load the new compiled defaults (accel 500,
-   max rate 5000, travel, inverts) — NVS keeps old values otherwise.
-4. **Driver fault auto-recovery**: a stall (e.g. Y racking) latches a DRV8452 off
-   until re-init (power-cycle). TODO: small DRV8452 plugin to re-assert EN_OUT on
-   nFAULT + expose current/microstep as live `$` settings.
+Since then (all in rts1.c): microstep now **1/32** (was 1/16 — fixes low-speed
+resonance / "harmonic" noise); each driver's config registers are read-back
+verified (a garbled current/decay frame made a driver run loud / fault); spindle
+is all-VFD + a quiet **on/off default** (NOT PWM — PA0's timers TIM5/TIM2 are the
+grblHAL stepper/RPM timers, so a PA0 PWM spindle hangs boot). Y2 "violent rattle"
+turned out to be a **bad Y2 motor connector** (wiring), now fixed.
+
+### E-STOP (motor-power monitor) — IN PROGRESS, recovery UNTESTED/UNSOLVED
+rts1.c polls the DRV8452 **FAULT reg (0x00, bit5 UVLO)** over SPI ~10 Hz:
+- **VM lost → grblHAL e_stop alarm: WORKS** (verified via ncSender log).
+- **VM restored → re-power motors: NOT working yet.** Hard finding from debug logs:
+  after a VM-UVLO event the DRV8452s get **stuck** — neither an in-place SPI
+  reconfigure NOR a full `NVIC_SystemReset()` (re-running board_init) re-enables
+  them (every CTRLx reads back 0x00). Only a real driver power-cycle recovers.
+  - Dropped the reboot idea (caused a USB disconnect, user disliked it, and it
+    didn't work anyway; also broke e-stop re-detection).
+  - **Current attempt (untested):** on VM-return, pulse the driver power/enable
+    straps **PC15+PB15 low→high (~50 ms)** to hardware-reset the DRV8452s, then
+    re-run the SPI config. See `rts1_recover_drivers()`.
+  - If the strap-cycle doesn't recover them: options are (a) recovery = full
+    controller power-cycle (document as the e-stop reset procedure), or (b) RE the
+    **stock firmware's** e-stop recovery sequence (it must do something specific —
+    nSLEEP pulse? specific SPI reg?). The VM voltage is also on ADC PA1/PA4 if a
+    cleaner sense is wanted.
+- **Test next session (PSU on):** boot Idle+holding; press e-stop → Alarm/e_stop;
+  release → do the motors re-grab? does re-pressing e-stop re-alarm? Watch the
+  ncSender log (`~/Library/Application Support/ncSender/logs/`).
+
+NEXT (besides e-stop):
+1. **Steps/mm calibration** ($100–$103): NOW 1/32 microstep — recompute (≈2× the
+   1/16 values) or measure a known move.
+2. **Axis direction/mapping**: $3=4 (Z), $8=0 (Y2 ganged) are baked defaults. Verify
+   each axis jogs correct way + correct motor. ($8 was 2, set to 0 per bring-up.)
+3. **Run `$RST=$`** after flashing to load compiled defaults (NVS keeps old else).
+
+## Flashing (now bullet-proof + fast, `scripts/`)
+`flash-grblhal.sh` auto-enters DFU with no BOOT0: it closes whatever app holds the
+CDC port (`lsof`→kill ncSender) and sends `$DFU` over serial (held-open fd, retries).
+`RTS1_FAST=1` skips read-back verify for quick iteration; `RTS1_NO_KILL=1` /
+`RTS1_NO_AUTODFU=1` to opt out. ncSender log dir: `~/Library/Application Support/ncSender/logs/`.
 
 ## Open items / TODO
 - **Axis↔driver order + directions**: provisional. Verify by jogging.
