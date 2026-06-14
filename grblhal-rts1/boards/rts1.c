@@ -57,6 +57,16 @@
 #define RTS1_SS_THR      0x28   // SS_CTRL5 transition (~80 Hz elec ~ 1500 mm/min; lower=less SS range)
 #define RTS1_SS_CTRL1    0x01   // SS_CTRL1: EN_SS=1, default sampling(2us)/PWM freq(25kHz)
 
+// ---- Stall detection (DRV8452 EN_STL) for sensorless homing. On stall, nFAULT is
+// driven LOW (STL_REP defaults to 1). Prereqs met: SPI mode + DECAY=111b smart-tune
+// ripple (CTRL1=0x0F). Enable per driver: CTRL4 EN_STL(bit4)=1, plus a 12-bit STALL_TH
+// in CTRL5 (TH[7:0]) + CTRL6[3:0] (TH[11:8]). Datasheet: set STALL_TH ~ no-load
+// TRQ_COUNT/2 (read TRQ_COUNT = CTRL7/CTRL8 via $DRV while the axis moves steadily).
+// Bring-up: X only (driver 0). nFAULT for X = PC5 (confirmed) = grblHAL X-limit input.
+#define RTS1_STALL_AXES  0x09    // bit i = enable stall on driver i (0=X 1=Y1 2=Y2 3=Z 4=A); 0x09 = X+Z
+#define RTS1_STALL_TH    0x08C   // 12-bit stall threshold (X tuned = 140; Z tuned live via $MD/$STH)
+#define RTS1_CTRL4_STALL 0x59    // CTRL4 = default 0x49 | EN_STL(0x10); keeps STL_REP=1
+
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
 
@@ -123,6 +133,13 @@ static bool drv_configure (uint8_t i)
     ok &= drv_cfg_reg(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2 : microstep, ext STEP/DIR
     ok &= drv_cfg_reg(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11: TRQ_DAC run current
     ok &= drv_cfg_reg(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
+#if RTS1_STALL_AXES
+    if(RTS1_STALL_AXES & (1u << i)) {                    // enable stall detection (sensorless homing)
+        ok &= drv_cfg_reg(i, 0x08, RTS1_STALL_TH & 0xFF);                  // CTRL5: STALL_TH[7:0]
+        ok &= drv_cfg_reg(i, 0x09, 0x20 | ((RTS1_STALL_TH >> 8) & 0x0F));  // CTRL6: STALL_TH[11:8] (DIS_SSC kept)
+        ok &= drv_cfg_reg(i, 0x07, RTS1_CTRL4_STALL);                      // CTRL4: EN_STL=1
+    }
+#endif
 #if RTS1_SS_ENABLE
     ok &= drv_cfg_reg(i, 0x32, RTS1_SS_KP);             // SS_CTRL2: silent-step Kp
     ok &= drv_cfg_reg(i, 0x33, RTS1_SS_KI);             // SS_CTRL3: silent-step Ki
@@ -228,9 +245,9 @@ static void rts1_puthex (char *buf, uint8_t *p, uint8_t v)
 static void rts1_dump_registers (void)
 {
     static const struct { char nm[4]; uint8_t reg; } regs[] = {
-        {"F",  0x00}, {"C1", 0x04}, {"C2",  0x05}, {"C3",  0x06}, {"C5", 0x08},
-        {"C6", 0x09}, {"C10",0x0D}, {"C11", 0x0E}, {"C13", 0x10},
-        {"S1", 0x31}, {"S2", 0x32}, {"S3",  0x33}, {"S4",  0x34}, {"S5", 0x35}
+        {"F",  0x00}, {"C1", 0x04}, {"C2",  0x05}, {"C3",  0x06}, {"C4", 0x07},
+        {"C5", 0x08}, {"C6", 0x09}, {"TQL",0x0A}, {"TQH", 0x0B}, {"C10",0x0D},
+        {"C11",0x0E}, {"C13",0x10}
     };
     for(uint8_t i = 0; i < DRV_N; i++) {
         char buf[128]; uint8_t p = 0;
@@ -247,12 +264,111 @@ static void rts1_dump_registers (void)
     }
 }
 
+// Read candidate fault/limit INPUT pins for nFAULT discovery ($PINS + an "@fault"
+// auto-snapshot). DRV8452 nFAULT asserts (open-drain LOW) on ANY driver fault, so
+// comparing an idle read against one captured at VM-loss reveals which GPIOs are the
+// driver fault bank. Excludes the driven straps (PA15/PB15/PC15 = outputs), CS
+// (PC0-4), SPI (PA5-7), STEP/DIR. Candidates are grblHAL-configured inputs
+// (limits PC5/6/7/PB4, auxin PC13/PC14).
+static void rts1_dump_pins (const char *tag)
+{
+    static const struct { char nm[5]; GPIO_TypeDef *port; uint16_t pin; } pins[] = {
+        {"PC5", GPIOC, GPIO_PIN_5},  {"PC6",  GPIOC, GPIO_PIN_6},  {"PC7", GPIOC, GPIO_PIN_7},
+        {"PB4", GPIOB, GPIO_PIN_4},  {"PC13", GPIOC, GPIO_PIN_13}, {"PC14",GPIOC, GPIO_PIN_14}
+    };
+    char buf[140]; uint8_t p = 0;
+    const char *h = "[MSG:PINS"; while(*h) buf[p++] = *h++;
+    if(tag) { buf[p++] = ' '; while(*tag) buf[p++] = *tag++; }
+    for(uint8_t i = 0; i < sizeof(pins) / sizeof(pins[0]); i++) {
+        buf[p++] = ' ';
+        const char *nm = pins[i].nm; while(*nm) buf[p++] = *nm++;
+        buf[p++] = '=';
+        buf[p++] = (pins[i].port->IDR & pins[i].pin) ? '1' : '0';
+    }
+    buf[p++] = ']'; buf[p++] = '\r'; buf[p++] = '\n'; buf[p] = '\0';
+    rts1_emit(buf);
+}
+
+// Live stall monitor: streams X (driver 0) TRQ_COUNT + nFAULT(PC5) + FAULT reg at
+// 5 Hz, automatically WHILE HOMING OR JOGGING (silent at idle so commands aren't
+// blocked). Use it to see whether TRQ_COUNT drops below STALL_TH during a grind and
+// whether PC5 asserts.
+static uint32_t rts1_mon_last = 0;
+static uint32_t rts1_tq_sample_last = 0;
+static uint16_t rts1_tq_min = 0x0FFF;            // lowest VALID TRQ_COUNT seen this move
+static uint8_t  rts1_mon_drv = 0;                // driver the monitor + $STH target ($MD=N)
+
+static uint16_t rts1_read_trq (void)
+{
+    uint8_t tl = drv_read(rts1_mon_drv, 0x0A), th = drv_read(rts1_mon_drv, 0x0B);  // TRQ_COUNT[7:0],[11:8]
+    return (uint16_t)((th & 0x0F) << 8) | tl;
+}
+
+static void rts1_puthex12 (char *b, uint8_t *p, uint16_t v)
+{
+    b[(*p)++] = '0'; b[(*p)++] = 'x';
+    b[(*p)++] = rts1_hexd[(v >> 8) & 0xF];
+    b[(*p)++] = rts1_hexd[(v >> 4) & 0xF];
+    b[(*p)++] = rts1_hexd[v & 0xF];
+}
+
+// Emit current + minimum TRQ_COUNT, nFAULT(PC5), FAULT reg. TQmin is the lowest the
+// torque count dipped to during this move = how far it gets toward stall before the
+// rotor locks (TRQ reverts to 0x0FFF when not turning). Set STALL_TH a bit ABOVE TQmin.
+static void rts1_mon_emit (uint16_t tq)
+{
+    uint8_t f = drv_read(rts1_mon_drv, 0x00);
+    char b[112]; uint8_t p = 0;
+    const char *h = "[MSG:MON D"; while(*h) b[p++] = *h++;
+    b[p++] = (char)('0' + rts1_mon_drv);
+    const char *t = " TQ="; while(*t) b[p++] = *t++; rts1_puthex12(b, &p, tq);
+    const char *m = " min="; while(*m) b[p++] = *m++; rts1_puthex12(b, &p, rts1_tq_min);
+    // candidate limit/fault input pins, to spot which one the monitored driver's stall asserts
+    const char *c5 = " PC5="; while(*c5) b[p++] = *c5++; b[p++] = (GPIOC->IDR & (1u<<5))  ? '1':'0';
+    const char *c6 = " PC6="; while(*c6) b[p++] = *c6++; b[p++] = (GPIOC->IDR & (1u<<6))  ? '1':'0';
+    const char *c7 = " PC7="; while(*c7) b[p++] = *c7++; b[p++] = (GPIOC->IDR & (1u<<7))  ? '1':'0';
+    const char *b4 = " PB4="; while(*b4) b[p++] = *b4++; b[p++] = (GPIOB->IDR & (1u<<4))  ? '1':'0';
+    const char *ff = " F="; while(*ff) b[p++] = *ff++; rts1_puthex(b, &p, f);
+    b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+    rts1_emit(b);
+}
+
 static on_unknown_sys_command_ptr rts1_on_sys_command = NULL;
 
 static status_code_t rts1_sys_command (sys_state_t state, char *line)
 {
     if(!strcmp(line, "DRV")) {                       // "$DRV": dump driver regs
         rts1_dump_registers();
+        return Status_OK;
+    }
+    if(!strcmp(line, "FPIN")) {                      // "$FPIN": dump candidate fault inputs
+        rts1_dump_pins(NULL);                        // ($PINS is a grblHAL built-in - shadowed)
+        return Status_OK;
+    }
+    if(!strncmp(line, "MD", 2) && (line[2] == '=' || line[2] == '\0')) {  // "$MD=N": select monitored/tuned driver
+        const char *v = line + 2; if(*v == '=') v++;
+        if(*v >= '0' && *v <= '4') rts1_mon_drv = (uint8_t)(*v - '0');
+        char b[28]; uint8_t p = 0;
+        const char *h = "[MSG:MON drv="; while(*h) b[p++] = *h++;
+        b[p++] = (char)('0' + rts1_mon_drv);
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
+        return Status_OK;
+    }
+    if(!strncmp(line, "STH", 3)) {                   // "$STH=N": set selected driver's STALL_TH live (decimal)
+        const char *v = line + 3;
+        if(*v == '=') v++;
+        uint16_t th = 0;
+        while(*v >= '0' && *v <= '9') th = th * 10 + (uint16_t)(*v++ - '0');
+        th &= 0x0FFF;
+        drv_write(rts1_mon_drv, 0x08, th & 0xFF);                  // CTRL5: STALL_TH[7:0]
+        drv_write(rts1_mon_drv, 0x09, 0x20 | ((th >> 8) & 0x0F));  // CTRL6: STALL_TH[11:8]
+        char b[40]; uint8_t p = 0;
+        const char *h = "[MSG:STALL_TH D"; while(*h) b[p++] = *h++;
+        b[p++] = (char)('0' + rts1_mon_drv); b[p++] = '=';
+        rts1_puthex12(b, &p, th);
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
         return Status_OK;
     }
     return rts1_on_sys_command ? rts1_on_sys_command(state, line) : Status_Unhandled;
@@ -332,9 +448,22 @@ static void rts1_realtime (sys_state_t state)
     static bool booted = false;                     // one-shot boot dump (stream up)
     if(!booted && now > 2500) {
         booted = true;
-        rts1_emit("[MSG:RTS1 diag build - $DRV dumps driver regs; e-stop logged]" ASCII_EOL);
+        rts1_emit("[MSG:RTS1 diag build - $DRV regs, $FPIN fault-pins; e-stop logged]" ASCII_EOL);
         rts1_dump_registers();
+        rts1_dump_pins("@boot");                    // idle baseline for nFAULT discovery
     }
+    if(state & (STATE_HOMING | STATE_JOG)) {        // stall telemetry while homing/jogging
+        if(now - rts1_tq_sample_last >= 10) {       // 100 Hz: track the lowest dip
+            rts1_tq_sample_last = now;
+            uint16_t tq = rts1_read_trq();
+            if(tq != 0x0FFF && tq < rts1_tq_min) rts1_tq_min = tq;
+            if(now - rts1_mon_last >= 200) {         // 5 Hz: emit current + min
+                rts1_mon_last = now;
+                rts1_mon_emit(tq);
+            }
+        }
+    } else
+        rts1_tq_min = 0x0FFF;                        // reset baseline at idle
 #endif
 
     if(now - rts1_poll_last >= 100) {               // poll VM ~10 Hz
@@ -346,6 +475,7 @@ static void rts1_realtime (sys_state_t state)
                 rts1_vm_fault = true;
 #if RTS1_DIAG
                 rts1_log_byte("VM-LOST fault", fault);
+                rts1_dump_pins("@fault");           // nFAULT bank snapshot (chips still powered)
 #endif
                 hal.control.interrupt_callback(rts1_control_get_state());
             }
@@ -402,6 +532,56 @@ static void rts1_estop_init (void)
     rts1_poll_last = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
 }
 
+// ===================== Sensorless homing (DRV8452 stall) =====================
+// A detected stall LATCHES: nFAULT (the limit input) stays asserted until CLR_FLT
+// (or an nSLEEP reset). grblHAL homing needs the limit to RELEASE after each pull-off
+// and to start a cycle with limits clean - otherwise the limit stays "triggered"
+// (indicator stuck RED) and homing alarms instead of completing. So we clear the
+// stall latch at: cycle start (hal.limits.enable), every homing phase (on_homing_rate_set
+// - pull-off in particular), and cycle end (on_homing_completed).
+static limits_enable_ptr       rts1_next_limits_enable = NULL;
+static on_homing_rate_set_ptr  rts1_next_homing_rate   = NULL;
+static on_homing_completed_ptr rts1_next_homing_done   = NULL;
+
+static void rts1_clr_stall (void)
+{
+    for(uint8_t i = 0; i < DRV_N; i++)
+        if(RTS1_STALL_AXES & (1u << i))
+            drv_write(i, 0x06, 0x3C | 0x80);        // CTRL3 CLR_FLT -> release latched stall/nFAULT
+}
+
+static void rts1_limits_enable (bool on, axes_signals_t homing_cycle)
+{
+    if(homing_cycle.mask)                            // a homing cycle is starting
+        rts1_clr_stall();                            // begin with the stall limits clean
+    if(rts1_next_limits_enable)
+        rts1_next_limits_enable(on, homing_cycle);
+}
+
+static void rts1_homing_rate_set (axes_signals_t axes, coord_data_t *feedrate, homing_mode_t mode)
+{
+    rts1_clr_stall();                                // release latch at each phase (pull-off needs it)
+    if(rts1_next_homing_rate)
+        rts1_next_homing_rate(axes, feedrate, mode);
+}
+
+static void rts1_homing_completed (axes_signals_t cycle, bool success)
+{
+    rts1_clr_stall();                                // clear so the limit indicator releases
+    if(rts1_next_homing_done)
+        rts1_next_homing_done(cycle, success);
+}
+
+static void rts1_homing_init (void)
+{
+    rts1_next_limits_enable = hal.limits.enable;
+    hal.limits.enable = rts1_limits_enable;
+    rts1_next_homing_rate = grbl.on_homing_rate_set;
+    grbl.on_homing_rate_set = rts1_homing_rate_set;
+    rts1_next_homing_done = grbl.on_homing_completed;
+    grbl.on_homing_completed = rts1_homing_completed;
+}
+
 void board_init (void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -427,6 +607,9 @@ void board_init (void)
 
     // Monitor motor power (VM): e-stop on loss, recover drivers on reset.
     rts1_estop_init();
+
+    // Sensorless homing: clear the DRV8452 stall latch at the right points.
+    rts1_homing_init();
 }
 
 #endif // BOARD_RTS1
