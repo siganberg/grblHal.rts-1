@@ -47,8 +47,26 @@ free_port() {
   return 0
 }
 
-# Ask a running grblHAL to reboot into the ROM DFU bootloader by sending "$DFU"
-# over its USB-CDC serial port. Best-effort: returns non-zero if no port found.
+# Preferred: ask ncSender (if running) to send "$DFU" to the controller through its
+# local HTTP API (POST /api/send-command on :8090). This is far more reliable than
+# the serial path below - ncSender owns the port and writes the line cleanly, so we
+# don't have to kill the app or fight the raw-serial timing. Returns non-zero if the
+# API isn't reachable (ncSender not running / not connected). Skip with RTS1_NO_API=1.
+# Override port with RTS1_NCSENDER_PORT.
+enter_dfu_via_api() {
+  [ "${RTS1_NO_API:-0}" = 1 ] && return 1
+  command -v curl >/dev/null 2>&1 || return 1
+  local port="${RTS1_NCSENDER_PORT:-8090}" code
+  code=$(curl -s -m 4 -o /dev/null -w '%{http_code}' \
+           -X POST "http://localhost:${port}/api/send-command" \
+           -H 'Content-Type: application/json' \
+           -d '{"command":"$DFU","displayCommand":"$DFU"}' 2>/dev/null) || return 1
+  [ "$code" = "200" ] && { echo ">> Sent \$DFU via ncSender API (:${port})."; return 0; }
+  return 1
+}
+
+# Fallback: ask a running grblHAL to reboot into the ROM DFU bootloader by sending
+# "$DFU" over its USB-CDC serial port. Best-effort: returns non-zero if no port found.
 enter_dfu_via_serial() {
   local sent=0 port
   # macOS exposes the CDC ACM device as /dev/cu.usbmodem*; a DFU device does not.
@@ -82,7 +100,8 @@ echo "============================================================"
 # --- ensure DFU mode (auto-enter from running grblHAL, else require BOOT0) ---
 if ! dfu_present && [ "${RTS1_NO_AUTODFU:-0}" != 1 ]; then
   for try in 1 2 3; do              # re-send $DFU a few times in case it's dropped
-    enter_dfu_via_serial || break   # no serial port -> nothing to do
+    # Prefer the ncSender API; fall back to raw serial (which closes the app first).
+    enter_dfu_via_api || enter_dfu_via_serial || break
     for _ in $(seq 1 15); do        # ~4.5 s for the bootloader to come up
       dfu_present && break 2
       sleep 0.3

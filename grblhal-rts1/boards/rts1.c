@@ -37,9 +37,25 @@
 // mapping (board full-scale) is unknown; 0xFF over-drove the motors (overcurrent
 // dropout on X/Y1), so use 0xC0 which was stable. Tune once a scope/logic-analyzer
 // confirms the exact value stock writes for 2.8 A.
-#define RTS1_DRV_RUN_CURRENT   0xC0   // CTRL11 TRQ_DAC (move)  ~2.8 A target (stable)
+#define RTS1_DRV_RUN_CURRENT   0xA0   // CTRL11 TRQ_DAC (move)  ~1.76 A (lowered from 0xC0 for quieter+cooler)
 #define RTS1_DRV_HOLD_CURRENT  0x40   // CTRL10 ISTSL  (idle)   ~0.75 A target
 #define RTS1_DRV_MICROSTEP     0x06   // CTRL2 low nibble: 0x06 = 1/16 (stock); $100-102 = 320/320/800
+
+// ---- Silent step decay (DRV8452 "EN_SS"): StealthChop-style voltage-mode PWM for
+// noiseless operation at standstill + low speed. Auto-transitions back to the CTRL1
+// DECAY mode (smart tune ripple) above SS_THR, so high-speed moves are unaffected.
+// SS_KP/SS_KI are the silent-step PI gains (datasheet 7.4 worked example as the
+// starting tune - tune by ear if low-speed current sounds rough). Registers 0x31-0x35.
+// Tuned for the actual motor: StepperOnline 23HS22-2804S (NEMA23, R=0.9 ohm,
+// L=2.5 mH, 2.8 A), VM=36 V, UGB=200 Hz, FPWM=25 kHz (SS_PWM_FREQ=00b).
+//   KP = 10*pi*UGB*L/VM       = 0.436  -> SS_KP=112 @ /256
+//   KI = KP*R/(FPWM*L)        = 0.0063 -> SS_KI=3   @ /512
+#define RTS1_SS_ENABLE   0      // 1 = enable silent step (unstable on these motors - hum/stall; off)
+#define RTS1_SS_KP       0x70   // SS_CTRL2 SS_KP   = 112  (KP=112/256=0.4375)
+#define RTS1_SS_KI       0x03   // SS_CTRL3 SS_KI   = 3    (KI=3/512=0.00586)
+#define RTS1_SS_DIV      0x43   // SS_CTRL4: SS_KI_DIV=/512 (b6:4=100), SS_KP_DIV=/256 (b2:0=011)
+#define RTS1_SS_THR      0x28   // SS_CTRL5 transition (~80 Hz elec ~ 1500 mm/min; lower=less SS range)
+#define RTS1_SS_CTRL1    0x01   // SS_CTRL1: EN_SS=1, default sampling(2us)/PWM freq(25kHz)
 
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
@@ -107,6 +123,13 @@ static bool drv_configure (uint8_t i)
     ok &= drv_cfg_reg(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2 : microstep, ext STEP/DIR
     ok &= drv_cfg_reg(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11: TRQ_DAC run current
     ok &= drv_cfg_reg(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
+#if RTS1_SS_ENABLE
+    ok &= drv_cfg_reg(i, 0x32, RTS1_SS_KP);             // SS_CTRL2: silent-step Kp
+    ok &= drv_cfg_reg(i, 0x33, RTS1_SS_KI);             // SS_CTRL3: silent-step Ki
+    ok &= drv_cfg_reg(i, 0x34, RTS1_SS_DIV);            // SS_CTRL4: Kp/Ki dividers
+    ok &= drv_cfg_reg(i, 0x35, RTS1_SS_THR);            // SS_CTRL5: SS->decay transition freq
+    ok &= drv_cfg_reg(i, 0x31, RTS1_SS_CTRL1);          // SS_CTRL1: EN_SS=1 (enable last)
+#endif
     ok &= drv_cfg_reg(i, 0x04, (uint8_t)(0x0F | 0x80)); // CTRL1 : EN_OUT=1 -> outputs on
     return ok;
 }
@@ -206,7 +229,8 @@ static void rts1_dump_registers (void)
 {
     static const struct { char nm[4]; uint8_t reg; } regs[] = {
         {"F",  0x00}, {"C1", 0x04}, {"C2",  0x05}, {"C3",  0x06}, {"C5", 0x08},
-        {"C6", 0x09}, {"C10",0x0D}, {"C11", 0x0E}, {"C13", 0x10}
+        {"C6", 0x09}, {"C10",0x0D}, {"C11", 0x0E}, {"C13", 0x10},
+        {"S1", 0x31}, {"S2", 0x32}, {"S3",  0x33}, {"S4",  0x34}, {"S5", 0x35}
     };
     for(uint8_t i = 0; i < DRV_N; i++) {
         char buf[128]; uint8_t p = 0;
