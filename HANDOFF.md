@@ -100,17 +100,33 @@ CDC port (`lsof`→kill ncSender) and sends `$DFU` over serial (held-open fd, re
 `RTS1_FAST=1` skips read-back verify for quick iteration; `RTS1_NO_KILL=1` /
 `RTS1_NO_AUTODFU=1` to opt out. ncSender log dir: `~/Library/Application Support/ncSender/logs/`.
 
+## Sensorless stall homing - DONE (X/Y auto-square/Z working; A configured/untested)
+grblHAL's native sensorless homing is Trinamic-only, so this is a custom board module
+in `boards/rts1.c`. KEY HW FACT: **nFAULT is a SHARED line** (PC5, all 5 DRV8452s
+OR-tied) - so the hardware-pin path can't tell axes apart and breaks ganged-Y. Instead:
+- Enable DRV8452 stall per driver: `EN_STL` (CTRL4=0x59) + a 12-bit `STALL_TH`
+  (CTRL5/6). Stall latches `FAULT` reg (0x00) **bit2** and pulls nFAULT low.
+- **Override `hal.homing.get_state`** to read each homed axis's OWN driver stall over
+  SPI: axis->driver {X:0, Y1:1, Y2:2, Z:3, A:4}; Y1->`.a`, Y2->`.b` so grblHAL
+  auto-squares the gantry. (homeGetState reads GPIO directly, so override homing.get_
+  state, NOT limits.get_state.)
+- Latch-clear hooks (cycle start / each phase / completion) so pull-off + locate work.
+- Per-axis `STALL_TH`: X/Y/A=140 (belt), Z=230 (leadscrew - loaded TRQ ~140 vs no-load
+  ~300). Tune live with `$MD=<drv>` + `$STH=<val>` (RTS1_DIAG build); watch the 5Hz MON
+  stream. STALL_TH is speed-dependent - re-tune if you change `$24/$25`.
+- **No physical switches**: `hal.limits.get_state` is overridden to report limits CLEAR
+  (sender indicators stay green; the phantom pins were floating/shared-nFAULT).
+- Baked defaults (NVS doesn't persist): `$5`(invert, cosmetic now), `$22=79`, `$20=1`,
+  `$40=1`. Diagnostics gated behind `RTS1_DIAG` (=0 ships quiet; =1 for re-tuning).
+
 ## Open items / TODO
 - **Axis↔driver order + directions**: provisional. Verify by jogging.
-- **Homing is sensorless (no limit switches)**: stock uses DRV8452 stall detection
-  (`stall_thresholds`). grblHAL's native sensorless homing is Trinamic-only, so plan
-  is to map DRV8452 STALL outputs → grblHAL limit inputs. **Needs RE** (find stall
-  pins + threshold mechanism). The current limit pins (PC5/6/7, PB4) are GUESSES —
-  ignore the limit indicator colors for now; disable hard limits/homing (`$21=0 $22=0`).
-- **E-stop = motor-power loss** (no signal wire), sensed via ADC on **PA1 or PA4**
-  (VM voltage). Optional grblHAL plugin later: alarm on VM drop.
-- **Modbus VFD**: DE on PA8 (AUXOUTPUT1, MODBUS_DIR_AUX=1) — verify with a scope
-  during a Modbus frame; confirm VFD type (currently Huanyang) and `$` addr.
+- **A-axis homing**: configured (driver 4, STALL_TH=140) but untested (no A motor).
+- **NVS persistence**: settings don't survive reboot on their own (flash-NVS not
+  working?) - we baked the important defaults as a workaround. Worth fixing properly.
+- **E-stop = motor-power loss**: DONE via SPI UVLO poll + auto-recovery (see below).
+- **Modbus VFD (H100)**: scaffolded (MODBUS_ENABLE=2, all VFD types, DE on PA8). Being
+  RE'd from stock fw on the `modbus` branch. Verify VFD type + register map + DE timing.
 - **Travel defaults** set: X440 Y440 Z110 (apply via `$RST=$` or `$130/$131/$132`).
 
 ## Recovered pin map (CORRECTED at bring-up via DRV8452 SPI RE)
