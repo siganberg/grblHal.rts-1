@@ -100,6 +100,25 @@ CDC port (`lsof`→kill ncSender) and sends `$DFU` over serial (held-open fd, re
 `RTS1_FAST=1` skips read-back verify for quick iteration; `RTS1_NO_KILL=1` /
 `RTS1_NO_AUTODFU=1` to opt out. ncSender log dir: `~/Library/Application Support/ncSender/logs/`.
 
+## Probe + isolated DB-25 I/O — DONE (TCA9555 I2C expander)
+**KEY DISCOVERY:** the 8 isolated inputs + PROBE + tool-setter + 4 outputs are NOT
+direct MCU pins — they hang off a **TCA9555 16-bit I2C I/O expander (U6, `PW555`)** on
+**I2C1 (PB6/PB7)** at addr **0x27**. (Found by: shorting probe changed no GPIO across
+all 4 ports → RE'd stock `SysInputTask` → `HAL_I2C` reads of 0x4E → board photos
+confirmed the TCA9555.) Active-low; read input ports 0/1 (reg 0x00, 2 bytes) = 16 bits.
+- **PROBE = expander bit 8** (DB-25 pin 22 / connector **J6**); **TLS = bit 9**.
+- `boards/rts1.c`: `rts1_tca_init` (blocking HAL I2C, 400 kHz), `rts1_realtime` polls +
+  caches at ~500 Hz, `hal.probe.get_state` overridden to read the cache (ISR-safe).
+  PROBE+TLS **tied** (`RTS1_PROBE_TIE_TLS`) — either contact triggers G38 / lights Probe.
+- **`$IEX`** = dump the 16 expander bits (probe-bit finder / input diagnostics).
+- Probe **macros work**: enabled `-D NGC_EXPRESSIONS_ENABLE=1` (ncSender probe blocks use
+  `#<vars>`/`[math]`). **Flash trade-off:** NGC + 2+ Modbus VFDs overflow the 256 KB
+  (the multi-spindle framework is ~36 KB), so VFDs trimmed to **H100 + on/off**
+  (`SPINDLE_ENABLE=192`, `N_SPINDLE=2`); `$DRV`/`$FPIN`/`$IDR`/`$IBIAS` diagnostics
+  removed/gated under `RTS1_DIAG` to reclaim flash. Build now ~87.5% flash.
+- TODO here: map the other 8 isolated inputs (bits 0–7) + 4 outputs (bits 11–14);
+  optional: register a *separate* grblHAL toolsetter (M6 auto tool-length) instead of tied.
+
 ## Open items / TODO
 - **Axis↔driver order + directions**: provisional. Verify by jogging.
 - **Homing is sensorless (no limit switches)**: stock uses DRV8452 stall detection
@@ -120,7 +139,9 @@ CDC port (`lsof`→kill ncSender) and sends `$DFU` over serial (held-open fd, re
   SPI mode 1, 8-bit, MSB, /16. Interface strap: PC14 LOW = SPI.
 - Modbus: USART1 PA9/PA10, DE PA8 (ISL3485) | Spindle PWM: PA0 | USB: PA11/PA12
 - Master enable: **PA15 (active-LOW)** | board straps: PB15, PC15 (HIGH)
-- Limits/inputs (provisional, mis-reading — see TODO): PB4, PC5/6/7, PC13
+- Isolated inputs/probe/TLS: **TCA9555 I2C expander @0x27** (NOT GPIO — see section above).
+  Direct GPIO inputs: **PC5 = OR-tied DRV8452 nFAULT**, **PC13 = reset/e-stop**.
+  (There are NO limit switches — homing is sensorless via DRV8452 stall.)
   NOTE: prior map had DIR on PC0-4 and "enable" on PB1/5/9/12/14 — BOTH WRONG.
 
 ## Set up a new machine (e.g. garage laptop)

@@ -221,6 +221,101 @@ static void rts1_drv8452_init (void)
     }
 }
 
+// ===================== TCA9555 isolated-I/O expander (I2C) =====================
+// All isolated DB-25 I/O (8 inputs + PROBE [J6] + tool-setter + the 4 outputs)
+// hangs off a TCA9555 16-bit I2C expander (U6) at 7-bit addr 0x27, on I2C1
+// (PB6=SCL, PB7=SDA, AF4). Stock reads input ports 0/1 (regs 0x00/0x01) = 16 bits.
+// RE: SysInputTask does HAL_I2C_Master_Transmit(0x4E, reg=0x00, 1) then
+// HAL_I2C_Master_Receive(0x4E, buf, 2). We replicate that with blocking HAL I2C.
+#define RTS1_TCA_ADDR    0x4E    // HAL 8-bit address = (0x27 << 1)
+#define RTS1_TCA_INPUT0  0x00    // input port 0 register (auto-increments to port 1)
+
+static I2C_HandleTypeDef rts1_i2c;
+
+static void rts1_tca_init (void)
+{
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_I2C1_CLK_ENABLE();
+    GPIO_InitTypeDef scl = {
+        .Pin       = GPIO_PIN_6 | GPIO_PIN_7,       // PB6=SCL, PB7=SDA
+        .Mode      = GPIO_MODE_AF_OD,               // I2C = open-drain
+        .Pull      = GPIO_PULLUP,                   // board has externals; internal is harmless
+        .Speed     = GPIO_SPEED_FREQ_HIGH,
+        .Alternate = GPIO_AF4_I2C1
+    };
+    HAL_GPIO_Init(GPIOB, &scl);
+
+    rts1_i2c.Instance             = I2C1;
+    rts1_i2c.Init.ClockSpeed      = 400000;         // 400 kHz fast mode (~0.15 ms/read)
+    rts1_i2c.Init.DutyCycle       = I2C_DUTYCYCLE_2;
+    rts1_i2c.Init.OwnAddress1     = 0;
+    rts1_i2c.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
+    rts1_i2c.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    rts1_i2c.Init.OwnAddress2     = 0;
+    rts1_i2c.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    rts1_i2c.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
+    HAL_I2C_Init(&rts1_i2c);
+}
+
+// Read the expander's 16 input bits (port0 = low byte, port1 = high byte).
+// Active-low: a grounded (triggered) input reads 0. Returns false on bus error.
+static bool rts1_tca_read (uint16_t *val)
+{
+    uint8_t buf[2];
+    if(HAL_I2C_Mem_Read(&rts1_i2c, RTS1_TCA_ADDR, RTS1_TCA_INPUT0,
+                        I2C_MEMADD_SIZE_8BIT, buf, 2, 5) != HAL_OK)
+        return false;
+    *val = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+    return true;
+}
+
+// ---- Isolated PROBE / tool-setter, read from the expander ----
+// Expander bit 8 = PROBE (J6), bit 9 = tool-setter; both active-low (0 = contact).
+// hal.probe.get_state is called from ISR context during a probe move, so it must
+// use the cached value (updated in rts1_realtime) - never touch I2C from there.
+#define RTS1_PROBE_BIT  8
+#define RTS1_TLS_BIT    9
+
+static volatile uint16_t rts1_iso = 0xFFFF;          // cached expander inputs (idle = all high)
+static uint32_t rts1_iso_last = 0;
+static bool rts1_probe_invert = false;               // is_probe_away ^ $6 (invert_probe_pin)
+static probe_configure_ptr rts1_next_probe_configure = NULL;
+
+static void rts1_probe_configure (bool is_probe_away, bool probing)
+{
+    rts1_probe_invert = is_probe_away ^ settings.probe.invert_probe_pin;
+    if(rts1_next_probe_configure)
+        rts1_next_probe_configure(is_probe_away, probing);
+}
+
+// Tie the tool-setter to the probe: with both on the same expander and no separate
+// grblHAL toolsetter pin, OR them so EITHER contact triggers G38 and lights the
+// Probe indicator (the "shared" mode). Set to 0 to use the probe (bit 8) alone.
+#define RTS1_PROBE_TIE_TLS  1
+
+static probe_state_t rts1_probe_get_state (void)
+{
+    probe_state_t s = {0};
+    s.connected = On;
+#if RTS1_PROBE_TIE_TLS
+    const uint16_t mask = (1u << RTS1_PROBE_BIT) | (1u << RTS1_TLS_BIT);
+    bool contact = (rts1_iso & mask) != mask;             // active-low: either bit 0 -> triggered
+#else
+    bool contact = !(rts1_iso & (1u << RTS1_PROBE_BIT));   // probe only
+#endif
+    s.triggered  = contact ^ rts1_probe_invert;
+    return s;
+}
+
+static void rts1_probe_init (void)
+{
+    if(hal.probe.get_state) {                         // probe HAL present (PROBE_ENABLE + aux claim)
+        rts1_next_probe_configure = hal.probe.configure;
+        hal.probe.configure = rts1_probe_configure;
+        hal.probe.get_state = rts1_probe_get_state;
+    }
+}
+
 // ======================= Diagnostics (logging + $DRV) =======================
 // RTS1_DIAG=1 streams e-stop/recovery events to the console and dumps the live
 // DRV8452 registers at boot + on every fault transition, and enables the "$DRV"
@@ -233,6 +328,7 @@ static const char rts1_hexd[] = "0123456789ABCDEF";
 
 static void rts1_emit (const char *s) { if(hal.stream.write) hal.stream.write(s); }
 
+#if RTS1_DIAG
 // Append "0xNN" for a byte into buf at *p.
 static void rts1_puthex (char *buf, uint8_t *p, uint8_t v)
 {
@@ -265,6 +361,7 @@ static void rts1_dump_registers (void)
         rts1_emit(buf);
     }
 }
+#endif // RTS1_DIAG (rts1_puthex + rts1_dump_registers)
 
 // Read candidate fault/limit INPUT pins for nFAULT discovery ($PINS + an "@fault"
 // auto-snapshot). DRV8452 nFAULT asserts (open-drain LOW) on ANY driver fault, so
@@ -272,6 +369,7 @@ static void rts1_dump_registers (void)
 // driver fault bank. Excludes the driven straps (PA15/PB15/PC15 = outputs), CS
 // (PC0-4), SPI (PA5-7), STEP/DIR. Candidates are grblHAL-configured inputs
 // (limits PC5/6/7/PB4, auxin PC13/PC14).
+#if RTS1_DIAG
 static void rts1_dump_pins (const char *tag)
 {
     static const struct { char nm[5]; GPIO_TypeDef *port; uint16_t pin; } pins[] = {
@@ -290,6 +388,7 @@ static void rts1_dump_pins (const char *tag)
     buf[p++] = ']'; buf[p++] = '\r'; buf[p++] = '\n'; buf[p] = '\0';
     rts1_emit(buf);
 }
+#endif
 
 // Live stall monitor: streams X (driver 0) TRQ_COUNT + nFAULT(PC5) + FAULT reg at
 // 5 Hz, automatically WHILE HOMING OR JOGGING (silent at idle so commands aren't
@@ -343,12 +442,32 @@ static on_unknown_sys_command_ptr rts1_on_sys_command = NULL;
 
 static status_code_t rts1_sys_command (sys_state_t state, char *line)
 {
+#if RTS1_DIAG
     if(!strcmp(line, "DRV")) {                       // "$DRV": dump driver regs
         rts1_dump_registers();
         return Status_OK;
     }
-    if(!strcmp(line, "FPIN")) {                      // "$FPIN": dump candidate fault inputs
-        rts1_dump_pins(NULL);                        // ($PINS is a grblHAL built-in - shadowed)
+#endif
+    if(!strcmp(line, "IEX")) {                       // "$IEX": read TCA9555 isolated-input expander (probe-bit finder)
+        uint16_t v; char b[96]; uint8_t p = 0;
+        const char *h = "[MSG:IEX ="; while(*h) b[p++] = *h++;
+        if(rts1_tca_read(&v)) {
+            b[p++]=rts1_hexd[(v>>12)&0xF]; b[p++]=rts1_hexd[(v>>8)&0xF];
+            b[p++]=rts1_hexd[(v>>4)&0xF];  b[p++]=rts1_hexd[v&0xF];
+            const char *lo = " low:"; while(*lo) b[p++] = *lo++;   // active (grounded) input bits
+            bool any = false;
+            for(int i = 0; i < 16; i++) if(!((v >> i) & 1)) {
+                b[p++] = ' ';
+                if(i >= 10) { b[p++] = '1'; b[p++] = (char)('0' + i - 10); }
+                else b[p++] = (char)('0' + i);
+                any = true;
+            }
+            if(!any) { b[p++] = ' '; b[p++] = '-'; }
+        } else {
+            const char *e = "ERR (no I2C ack @0x27)"; while(*e) b[p++] = *e++;
+        }
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
         return Status_OK;
     }
     if(!strncmp(line, "MD", 2) && (line[2] == '=' || line[2] == '\0')) {  // "$MD=N": select monitored/tuned driver
@@ -451,6 +570,15 @@ static void rts1_log_byte (const char *tag, uint8_t v)
 static void rts1_realtime (sys_state_t state)
 {
     uint32_t now = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
+
+    // Poll the TCA9555 isolated inputs (probe/tool-setter/...) and cache them for
+    // the probe HAL, which runs in ISR context and must not block on I2C.
+    if(now - rts1_iso_last >= 2) {                   // ~500 Hz (I2C @400 kHz ~0.15 ms/read)
+        rts1_iso_last = now;
+        uint16_t v;
+        if(rts1_tca_read(&v))
+            rts1_iso = v;
+    }
 
 #if RTS1_DIAG
     static bool booted = false;                     // one-shot boot dump (stream up)
@@ -675,6 +803,11 @@ void board_init (void)
 
     // Sensorless homing: clear the DRV8452 stall latch at the right points.
     rts1_homing_init();
+
+    // TCA9555 I2C expander: gateway to all isolated DB-25 I/O (probe, tool-setter,
+    // 8 inputs, 4 outputs). Init the bus, then route the probe bit into grblHAL.
+    rts1_tca_init();
+    rts1_probe_init();
 }
 
 #endif // BOARD_RTS1
