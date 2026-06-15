@@ -63,8 +63,9 @@
 // in CTRL5 (TH[7:0]) + CTRL6[3:0] (TH[11:8]). Datasheet: set STALL_TH ~ no-load
 // TRQ_COUNT/2 (read TRQ_COUNT = CTRL7/CTRL8 via $DRV while the axis moves steadily).
 // Bring-up: X only (driver 0). nFAULT for X = PC5 (confirmed) = grblHAL X-limit input.
-#define RTS1_STALL_AXES  0x09    // bit i = enable stall on driver i (0=X 1=Y1 2=Y2 3=Z 4=A); 0x09 = X+Z
-#define RTS1_STALL_TH    0x08C   // 12-bit stall threshold (X tuned = 140; Z tuned live via $MD/$STH)
+#define RTS1_STALL_AXES  0x1F    // bit i = enable stall on driver i (0=X 1=Y1 2=Y2 3=Z 4=A); 0x1F = all
+#define RTS1_STALL_TH_X  140     // X/Y/A (belt) - X tuned; Y/A start here (belt-like), tune if needed
+#define RTS1_STALL_TH_Z  230     // Z (leadscrew) - needs higher (loaded TRQ ~140 vs no-load ~300)
 #define RTS1_CTRL4_STALL 0x59    // CTRL4 = default 0x49 | EN_STL(0x10); keeps STL_REP=1
 
 #define DRV_N        5
@@ -135,8 +136,9 @@ static bool drv_configure (uint8_t i)
     ok &= drv_cfg_reg(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
 #if RTS1_STALL_AXES
     if(RTS1_STALL_AXES & (1u << i)) {                    // enable stall detection (sensorless homing)
-        ok &= drv_cfg_reg(i, 0x08, RTS1_STALL_TH & 0xFF);                  // CTRL5: STALL_TH[7:0]
-        ok &= drv_cfg_reg(i, 0x09, 0x20 | ((RTS1_STALL_TH >> 8) & 0x0F));  // CTRL6: STALL_TH[11:8] (DIS_SSC kept)
+        uint16_t th = (i == 3) ? RTS1_STALL_TH_Z : RTS1_STALL_TH_X;        // driver 3 = Z (leadscrew)
+        ok &= drv_cfg_reg(i, 0x08, th & 0xFF);                            // CTRL5: STALL_TH[7:0]
+        ok &= drv_cfg_reg(i, 0x09, 0x20 | ((th >> 8) & 0x0F));            // CTRL6: STALL_TH[11:8] (DIS_SSC kept)
         ok &= drv_cfg_reg(i, 0x07, RTS1_CTRL4_STALL);                      // CTRL4: EN_STL=1
     }
 #endif
@@ -539,9 +541,22 @@ static void rts1_estop_init (void)
 // (indicator stuck RED) and homing alarms instead of completing. So we clear the
 // stall latch at: cycle start (hal.limits.enable), every homing phase (on_homing_rate_set
 // - pull-off in particular), and cycle end (on_homing_completed).
+// nFAULT is a SHARED line (PC5, all drivers OR-tied), so it can't tell axes apart and
+// would break ganged-Y. Instead, while homing, we read each homed axis's OWN driver
+// STALL bit over SPI and report it as that axis's home signal. This is the per-driver
+// equivalent of Trinamic's TMC_POLL_STALLED path.
+#define RTS1_STALL_BIT  0x04                         // FAULT reg (0x00) bit2 = motor stall (observed F=0x84)
+
+// Logical axis -> primary DRV8452 driver. Driver order is X,Y1,Y2,Z,A = 0..4, so
+// logical X Y Z A map to drivers 0 1 3 4; Y's second motor (Y2) = driver 2 -> .b.
+static const uint8_t rts1_axis_drv[N_AXIS] = { 0, 1, 3, 4 };
+
 static limits_enable_ptr       rts1_next_limits_enable = NULL;
+static home_get_state_ptr      rts1_next_home_state    = NULL;
 static on_homing_rate_set_ptr  rts1_next_homing_rate   = NULL;
 static on_homing_completed_ptr rts1_next_homing_done   = NULL;
+static bool                    rts1_homing_active = false;
+static axes_signals_t          rts1_homing_axes   = {0};
 
 static void rts1_clr_stall (void)
 {
@@ -552,10 +567,41 @@ static void rts1_clr_stall (void)
 
 static void rts1_limits_enable (bool on, axes_signals_t homing_cycle)
 {
-    if(homing_cycle.mask)                            // a homing cycle is starting
-        rts1_clr_stall();                            // begin with the stall limits clean
+    rts1_homing_axes   = homing_cycle;
+    rts1_homing_active = homing_cycle.mask != 0;     // a homing cycle is in progress
+    if(rts1_homing_active)
+        rts1_clr_stall();                            // begin the cycle with the stall limits clean
     if(rts1_next_limits_enable)
         rts1_next_limits_enable(on, homing_cycle);
+}
+
+// Per-driver SPI stall read for the homed axes. .a = primary motor; .b = second motor
+// of an auto-squared axis (Y2 = driver 2). Rate-limited to one read per ms (the stall
+// LATCHES, so this can't miss it). When not homing, defers to the GPIO home reader.
+static home_signals_t rts1_homing_get_state (void)
+{
+    if(!rts1_homing_active)
+        return rts1_next_home_state ? rts1_next_home_state() : (home_signals_t){0};
+
+    static uint32_t last = 0;
+    static home_signals_t cache = {0};
+    uint32_t now = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
+    if(now != last) {
+        last = now;
+        home_signals_t s = {0};
+        for(uint8_t a = 0; a < N_AXIS; a++) {
+            if(!(rts1_homing_axes.mask & (1u << a)))
+                continue;
+            if(drv_read(rts1_axis_drv[a], 0x00) & RTS1_STALL_BIT)
+                s.a.mask |= (1u << a);
+#if Y_AUTO_SQUARE
+            if(a == Y_AXIS && (drv_read(2, 0x00) & RTS1_STALL_BIT))
+                s.b.mask |= (1u << a);               // Y second motor (driver 2) for auto-square
+#endif
+        }
+        cache = s;
+    }
+    return cache;
 }
 
 static void rts1_homing_rate_set (axes_signals_t axes, coord_data_t *feedrate, homing_mode_t mode)
@@ -576,6 +622,8 @@ static void rts1_homing_init (void)
 {
     rts1_next_limits_enable = hal.limits.enable;
     hal.limits.enable = rts1_limits_enable;
+    rts1_next_home_state = hal.homing.get_state;     // SPI per-driver stall as the home signal
+    hal.homing.get_state = rts1_homing_get_state;
     rts1_next_homing_rate = grbl.on_homing_rate_set;
     grbl.on_homing_rate_set = rts1_homing_rate_set;
     rts1_next_homing_done = grbl.on_homing_completed;
