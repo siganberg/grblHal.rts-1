@@ -226,7 +226,7 @@ static void rts1_drv8452_init (void)
 // DRV8452 registers at boot + on every fault transition, and enables the "$DRV"
 // command (dump all five drivers' registers on demand). Set to 0 to ship quiet.
 #ifndef RTS1_DIAG
-#define RTS1_DIAG 1
+#define RTS1_DIAG 0
 #endif
 
 static const char rts1_hexd[] = "0123456789ABCDEF";
@@ -295,16 +295,18 @@ static void rts1_dump_pins (const char *tag)
 // 5 Hz, automatically WHILE HOMING OR JOGGING (silent at idle so commands aren't
 // blocked). Use it to see whether TRQ_COUNT drops below STALL_TH during a grind and
 // whether PC5 asserts.
+static uint8_t  rts1_mon_drv = 0;                // driver the $STH target ($MD=N)
+#if RTS1_DIAG
 static uint32_t rts1_mon_last = 0;
 static uint32_t rts1_tq_sample_last = 0;
 static uint16_t rts1_tq_min = 0x0FFF;            // lowest VALID TRQ_COUNT seen this move
-static uint8_t  rts1_mon_drv = 0;                // driver the monitor + $STH target ($MD=N)
 
 static uint16_t rts1_read_trq (void)
 {
     uint8_t tl = drv_read(rts1_mon_drv, 0x0A), th = drv_read(rts1_mon_drv, 0x0B);  // TRQ_COUNT[7:0],[11:8]
     return (uint16_t)((th & 0x0F) << 8) | tl;
 }
+#endif
 
 static void rts1_puthex12 (char *b, uint8_t *p, uint16_t v)
 {
@@ -317,6 +319,7 @@ static void rts1_puthex12 (char *b, uint8_t *p, uint16_t v)
 // Emit current + minimum TRQ_COUNT, nFAULT(PC5), FAULT reg. TQmin is the lowest the
 // torque count dipped to during this move = how far it gets toward stall before the
 // rotor locks (TRQ reverts to 0x0FFF when not turning). Set STALL_TH a bit ABOVE TQmin.
+#if RTS1_DIAG
 static void rts1_mon_emit (uint16_t tq)
 {
     uint8_t f = drv_read(rts1_mon_drv, 0x00);
@@ -334,6 +337,7 @@ static void rts1_mon_emit (uint16_t tq)
     b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
     rts1_emit(b);
 }
+#endif
 
 static on_unknown_sys_command_ptr rts1_on_sys_command = NULL;
 
@@ -430,6 +434,7 @@ static bool rts1_recover_drivers (void)
     return all_ok;
 }
 
+#if RTS1_DIAG
 // Emit "[MSG:RTS1 <tag>=0xNN]".
 static void rts1_log_byte (const char *tag, uint8_t v)
 {
@@ -441,6 +446,7 @@ static void rts1_log_byte (const char *tag, uint8_t v)
     b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
     rts1_emit(b);
 }
+#endif
 
 static void rts1_realtime (sys_state_t state)
 {
@@ -575,6 +581,16 @@ static void rts1_limits_enable (bool on, axes_signals_t homing_cycle)
         rts1_next_limits_enable(on, homing_cycle);
 }
 
+// This machine has NO physical limit switches (homing is sensorless via the SPI stall
+// read in rts1_homing_get_state; hard limits are unused). The "limit" pins are phantoms
+// - floating (Y2=PB4 idles low, Y=PC6 high so no invert can green them both) or the
+// shared nFAULT (X=PC5). Report all limits CLEAR so the sender's indicators stay green
+// instead of showing nonsense. Does not affect homing (that uses hal.homing.get_state).
+static limit_signals_t rts1_limits_get_state (void)
+{
+    return (limit_signals_t){0};
+}
+
 // Per-driver SPI stall read for the homed axes. .a = primary motor; .b = second motor
 // of an auto-squared axis (Y2 = driver 2). Rate-limited to one read per ms (the stall
 // LATCHES, so this can't miss it). When not homing, defers to the GPIO home reader.
@@ -622,6 +638,7 @@ static void rts1_homing_init (void)
 {
     rts1_next_limits_enable = hal.limits.enable;
     hal.limits.enable = rts1_limits_enable;
+    hal.limits.get_state = rts1_limits_get_state;    // no switches -> always report limits clear
     rts1_next_home_state = hal.homing.get_state;     // SPI per-driver stall as the home signal
     hal.homing.get_state = rts1_homing_get_state;
     rts1_next_homing_rate = grbl.on_homing_rate_set;
