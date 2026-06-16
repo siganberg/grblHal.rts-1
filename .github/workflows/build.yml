@@ -8,7 +8,9 @@ name: Build firmware
 on:
   push:
     branches: [main, modbus]
-    tags: ['v*']
+    tags:
+      - 'v*'
+      - '!v*-beta*'
   pull_request:
   workflow_dispatch:
 
@@ -21,6 +23,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history + tags so the tag annotation (release notes) is available
+          fetch-tags: true
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -63,7 +68,17 @@ jobs:
 
       - name: Publish GitHub Release (tag builds only)
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Release notes = the annotated tag's message (written by scripts/release.sh via Claude)
+          git tag -l --format='%(contents)' "$TAG" > release-notes.md
+          [ -s release-notes.md ] || echo "Release $TAG" > release-notes.md
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Release $TAG" \
+            --notes-file release-notes.md \
+            dist/*.bin dist/*.hex

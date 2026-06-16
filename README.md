@@ -124,8 +124,11 @@ cd grblhal-rts1 && ./setup.sh && cd STM32F4xx && pio run -e RTS1
 # flash the build you just made (controller in DFU mode):
 ../../scripts/flash-grblhal.sh
 ```
-**CI:** every push builds the firmware; pushing a `v*` tag publishes a **Release** with the
-`.bin` + `.hex` automatically (see [`.github/workflows/build.yml`](.github/workflows/build.yml)).
+**Cutting a release:** run **`./scripts/release.sh`** — it bumps the version, generates
+user-facing release notes from the commit log (via the `claude` CLI), and pushes an
+annotated tag. CI then builds the firmware and publishes a **GitHub Release** with the
+`.bin` + `.hex` and those notes (same flow as ncSender). Every push/PR also builds and
+uploads the artifacts for testing. See [`.github/workflows/build.yml`](.github/workflows/build.yml).
 
 ---
 
