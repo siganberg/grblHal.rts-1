@@ -1,13 +1,10 @@
-# README images — to add
+# README images
 
-Drop these screenshots/photos here so the flashing guide in the main
-[`README.md`](../../README.md) renders them. Keep the exact filenames.
+Images used by the flashing guide in the main [`README.md`](../../README.md).
 
-| Filename | What to show | Status |
-|---|---|---|
-| `boot0-button.png` | Photo of the open controller with the **BOOT0** button clearly circled/arrowed. | TODO |
-| `boot0-usb-dfu.webp` | Holding BOOT0 while plugging in USB-C (animated). | ✅ done (~10s clip) |
-| `ncsender-flash.png` | ncSender **Settings → Firmware → Flash Firmware** dialog (selecting the `.hex`). | TODO |
+| Filename | What it shows |
+|---|---|
+| `boot0-usb-dfu.webp` | Animated (~10 s): holding the BOOT0 button while plugging in USB-C to enter DFU mode. |
 
-Tips for friendly screenshots: crop tight, add a colored circle/arrow on the key element,
-and keep them a reasonable width (~800–1000 px). PNG or JPG is fine.
+The BOOT0+USB animation covers the first-time-flash steps, so no other screenshots are
+needed. If you ever want to add more, drop them here and reference them from the README.

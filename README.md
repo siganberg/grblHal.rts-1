@@ -49,9 +49,6 @@ Go to the **[Releases page](../../releases)** and download the latest
 Power **off** the controller and unplug everything. Open the case (**2.5 mm hex driver**)
 and locate the small **BOOT0** button on the board.
 
-<!-- TODO image: photo of the controller board with the BOOT0 button circled -->
-![BOOT0 button location](docs/images/boot0-button.png)
-
 ### Step 3 — Enter DFU mode
 1. **Press and hold** the **BOOT0** button.
 2. While holding it, **plug the USB-C cable** into the controller and your computer.
@@ -69,9 +66,6 @@ Use **one** of these:
 Open ncSender → **Settings → Firmware → Flash Firmware**, select the downloaded
 `grblhal-rts1-<version>.hex`, and start. ncSender flashes the controller while it's in
 DFU mode.
-
-<!-- TODO image: ncSender Settings > Firmware > Flash Firmware dialog -->
-![ncSender Flash Firmware](docs/images/ncsender-flash.png)
 
 **Option B — command line (advanced):**
 Install **dfu-util** (`brew install dfu-util` on macOS, `sudo apt install dfu-util` on
@@ -98,8 +92,6 @@ machine starts in an **Alarm** state, that's normal (homing lock); click **Unloc
 2. ncSender → **Settings → Firmware → Flash Firmware** → select the `.hex` → start.
 
 ncSender puts the controller into update mode and flashes it for you.
-
-<!-- TODO image: ncSender update flow (same dialog as above is fine) -->
 
 ---
 
