@@ -157,3 +157,9 @@ uploads the artifacts for testing. See [`.github/workflows/build.yml`](.github/w
 ## Status
 Firmware is working and in testing: motors energize/home, probe + tool-setter, parking,
 all VFDs, persistent settings, and self-healing boot power-up. See **[docs/HANDOFF.md](docs/HANDOFF.md)**.
+
+## License
+Licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)** — see
+[`LICENSE`](LICENSE). This firmware builds on **[grblHAL](https://github.com/grblHAL)**,
+which is GPLv3; combining the two is permitted under GPLv3 §13, and grblHAL source files
+keep their original GPLv3 headers.
