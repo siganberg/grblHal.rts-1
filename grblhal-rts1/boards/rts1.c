@@ -225,36 +225,14 @@ static void rts1_drv8452_init (void)
 // All isolated DB-25 I/O (8 inputs + PROBE [J6] + tool-setter + the 4 outputs)
 // hangs off a TCA9555 16-bit I2C expander (U6) at 7-bit addr 0x27, on I2C1
 // (PB6=SCL, PB7=SDA, AF4). Stock reads input ports 0/1 (regs 0x00/0x01) = 16 bits.
-// RE: SysInputTask does HAL_I2C_Master_Transmit(0x4E, reg=0x00, 1) then
-// HAL_I2C_Master_Receive(0x4E, buf, 2). We replicate that with blocking HAL I2C.
-#define RTS1_TCA_ADDR    0x4E    // HAL 8-bit address = (0x27 << 1)
+// We share grblHAL's I2C driver (i2c_transfer) so the bus is owned ONCE - the
+// I2C EEPROM (NVS @0x50) lives on the same bus. i2c_transfer does write-reg + read.
+#define RTS1_TCA_ADDR    0x27    // 7-bit I2C address (i2c_transfer shifts internally)
 #define RTS1_TCA_INPUT0  0x00    // input port 0 register (auto-increments to port 1)
-
-static I2C_HandleTypeDef rts1_i2c;
 
 static void rts1_tca_init (void)
 {
-    __HAL_RCC_GPIOB_CLK_ENABLE();
-    __HAL_RCC_I2C1_CLK_ENABLE();
-    GPIO_InitTypeDef scl = {
-        .Pin       = GPIO_PIN_6 | GPIO_PIN_7,       // PB6=SCL, PB7=SDA
-        .Mode      = GPIO_MODE_AF_OD,               // I2C = open-drain
-        .Pull      = GPIO_PULLUP,                   // board has externals; internal is harmless
-        .Speed     = GPIO_SPEED_FREQ_HIGH,
-        .Alternate = GPIO_AF4_I2C1
-    };
-    HAL_GPIO_Init(GPIOB, &scl);
-
-    rts1_i2c.Instance             = I2C1;
-    rts1_i2c.Init.ClockSpeed      = 400000;         // 400 kHz fast mode (~0.15 ms/read)
-    rts1_i2c.Init.DutyCycle       = I2C_DUTYCYCLE_2;
-    rts1_i2c.Init.OwnAddress1     = 0;
-    rts1_i2c.Init.AddressingMode  = I2C_ADDRESSINGMODE_7BIT;
-    rts1_i2c.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-    rts1_i2c.Init.OwnAddress2     = 0;
-    rts1_i2c.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-    rts1_i2c.Init.NoStretchMode   = I2C_NOSTRETCH_DISABLE;
-    HAL_I2C_Init(&rts1_i2c);
+    i2c_start();    // init I2C1 (PB6/PB7); idempotent if the EEPROM/NVS layer already did
 }
 
 // Read the expander's 16 input bits (port0 = low byte, port1 = high byte).
@@ -262,8 +240,13 @@ static void rts1_tca_init (void)
 static bool rts1_tca_read (uint16_t *val)
 {
     uint8_t buf[2];
-    if(HAL_I2C_Mem_Read(&rts1_i2c, RTS1_TCA_ADDR, RTS1_TCA_INPUT0,
-                        I2C_MEMADD_SIZE_8BIT, buf, 2, 5) != HAL_OK)
+    i2c_transfer_t t = {0};
+    t.address         = RTS1_TCA_ADDR;
+    t.word_addr       = RTS1_TCA_INPUT0;    // register pointer written before the read
+    t.word_addr_bytes = 1;
+    t.count           = 2;
+    t.data            = buf;
+    if(!i2c_transfer(&t, true))             // read (blocking)
         return false;
     *val = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
     return true;
