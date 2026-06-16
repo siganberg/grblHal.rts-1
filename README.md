@@ -25,6 +25,8 @@ firmware so you can run the controller with grblHAL and senders like **ncSender*
 ## ⚠️ Before you begin — what you need
 - Your RTS-1 controller and its **USB-C** cable.
 - A computer (**Windows / macOS / Linux**).
+- **[ncSender](https://github.com/siganberg/ncSender/releases)** — download and install the
+  latest release. It's what you'll use to flash the firmware and run the machine.
 - The latest firmware files from the **[Releases page](../../releases)**:
   - `grblhal-rts1-<version>.hex` — for ncSender's flashing tool
   - `grblhal-rts1-<version>.bin` — for manual DFU flashing
@@ -66,6 +68,8 @@ Use **one** of these:
 Open ncSender → **Settings → Firmware → Flash Firmware**, select the downloaded
 `grblhal-rts1-<version>.hex`, and start. ncSender flashes the controller while it's in
 DFU mode.
+
+![Flashing grblHAL with ncSender's Firmware tool (controller in DFU mode)](docs/images/ncsender-flash.webp)
 
 **Option B — command line (advanced):**
 Install **dfu-util** (`brew install dfu-util` on macOS, `sudo apt install dfu-util` on
