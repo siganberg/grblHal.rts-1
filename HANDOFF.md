@@ -124,7 +124,15 @@ confirmed the TCA9555.) Active-low; read input ports 0/1 (reg 0x00, 2 bytes) = 1
 - TODO here: map the other 8 isolated inputs (bits 0–7) + 4 outputs (bits 11–14);
   optional: register a *separate* grblHAL toolsetter (M6 auto tool-length) instead of tied.
 
-## I2C EEPROM → persistent NVS + reclaim 16 KB flash (PLANNED, needs hardware test)
+## I2C EEPROM → persistent NVS + reclaim 16 KB flash (DONE - hardware-confirmed)
+**DONE via Option A.** Settings now persist across power-cycles (`[NVS STORAGE:*EEPROM 4K]`;
+`$110=1234` survived two reboots) and the reclaimed 16 KB let us **restore ALL 7 VFDs**
+(`SPINDLE_ENABLE=1048830`, `N_SPINDLE=8`) - build 244.4 KB of the 240 KB region, ~1.3 KB
+free. Config: `EEPROM_ENABLE=32 I2C_ENABLE=1
+I2C_PORT=1 I2C1_ALT_PINMAP` + `eeprom` lib; `rts1_tca_read` reworked to grblHAL `i2c_transfer`
+(one I2C owner); custom `STM32F401RC_FLASH.ld` (installed by setup.sh) spans sectors 1-5.
+The original plan/notes follow for reference.
+
 Two problems, one fix. (1) Settings don't persist (NVS is flash-emulation, unreliable
 here) so everything is baked as compiled defaults. (2) The ldscript reserves a 16 KB
 sector for that flash-NVS, capping usable code at 224 KB (we're maxed).
