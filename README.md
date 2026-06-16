@@ -1,49 +1,150 @@
-# RealTime CNC RTS-1 → grblHAL project
+# RTS-1 grblHAL Firmware
 
-Reverse-engineering the Onefinity **RTS-1 Open-Loop** controller ("GSD RTS-1")
-to replace the stock closed firmware with **grblHAL**.
+Open-source **[grblHAL](https://github.com/grblHAL)** firmware for the Onefinity
+**RTS-1 Open-Loop** controller (RealTime CNC / GSD RTS-1). It replaces the stock
+firmware so you can run the controller with grblHAL and senders like **ncSender**.
+
+> ⚠️ **Please read first.** Flashing replaces the stock firmware. It's reversible — the
+> original firmware is backed up in [`firmware/`](firmware/) and you can
+> [restore it](#-restore-the-stock-firmware) anytime — but follow the steps carefully.
+> You do this at your own risk.
+
+---
+
+## ✨ What you get
+- Full **grblHAL** with all 4 axes (X, Y, Z, A) + **dual-Y auto-squaring** gantry.
+- **Probe + tool-setter**, **sensorless homing**, **parking**, and **probe macros**.
+- **All VFD types** (Huanyang, GS20, H-100, …) selectable in software — pick yours with `$395`.
+- **Settings that persist** across power cycles and reflashes.
+- Works with **ncSender** over USB-C.
+
+---
+
+## ⚠️ Before you begin — what you need
+- Your RTS-1 controller and its **USB-C** cable.
+- A computer (**Windows / macOS / Linux**).
+- The latest firmware files from the **[Releases page](../../releases)**:
+  - `grblhal-rts1-<version>.hex` — for ncSender's flashing tool
+  - `grblhal-rts1-<version>.bin` — for manual DFU flashing
+- **First-time install only:** a small screwdriver to open the controller case (to reach
+  the **BOOT0** button). After grblHAL is installed, future updates need **no opening**.
+
+---
+
+## 🔌 Install grblHAL for the first time (coming from stock firmware)
+
+The first install needs the controller in **DFU mode** (a special update mode built into
+the chip). You put it there by holding the **BOOT0** button while plugging in USB.
+
+> 💡 You only ever do this once. After grblHAL is installed, updates are done from
+> ncSender without opening the case (see [Updating](#️-update-grblhal-already-on-grblhal)).
+
+### Step 1 — Download the firmware
+Go to the **[Releases page](../../releases)** and download the latest
+`grblhal-rts1-<version>.bin` (and `.hex`) to your computer.
+
+### Step 2 — Open the case and find the BOOT0 button
+Power **off** the controller and unplug everything. Open the case and locate the small
+**BOOT0** button on the board.
+
+<!-- TODO image: photo of the controller board with the BOOT0 button circled -->
+![BOOT0 button location](docs/images/boot0-button.png)
+
+### Step 3 — Enter DFU mode
+1. **Press and hold** the **BOOT0** button.
+2. While holding it, **plug the USB-C cable** into the controller and your computer.
+3. **Release** the button after a second.
+
+The controller is now in **DFU mode** (it shows up as a *STM32 BOOTLOADER* /
+`0483:DF11` device). Nothing will light up like normal — that's expected.
+
+<!-- TODO image: BOOT0 held + USB plug-in, and/or the DFU device showing on the PC -->
+![Holding BOOT0 while connecting USB](docs/images/boot0-usb-dfu.png)
+
+### Step 4 — Flash grblHAL
+Use **one** of these:
+
+**Option A — ncSender (friendliest):**
+Open ncSender → **Settings → Firmware → Flash Firmware**, select the downloaded
+`grblhal-rts1-<version>.hex`, and start. ncSender flashes the controller while it's in
+DFU mode.
+
+<!-- TODO image: ncSender Settings > Firmware > Flash Firmware dialog -->
+![ncSender Flash Firmware](docs/images/ncsender-flash.png)
+
+**Option B — command line (advanced):**
+Install **dfu-util** (`brew install dfu-util` on macOS, `sudo apt install dfu-util` on
+Linux; on Windows install dfu-util and set the WinUSB driver with **Zadig**), then run:
+```bash
+dfu-util -a 0 -s 0x08000000:leave -D grblhal-rts1-<version>.bin
+```
+
+### Step 5 — Done
+Close the case, reconnect USB, and open ncSender — it should connect to grblHAL. If the
+machine starts in an **Alarm** state, that's normal (homing lock); click **Unlock**, then
+**Home**.
+
+> 🆘 **If something goes wrong / it won't connect:** just repeat Steps 2–4. DFU mode is in
+> the chip's ROM and can't be bricked — you can always re-enter it with the BOOT0 button.
+
+---
+
+## ⬆️ Update grblHAL (already on grblHAL)
+
+**No need to open the case.** From ncSender:
+
+1. Download the latest `grblhal-rts1-<version>.hex` from the **[Releases page](../../releases)**.
+2. ncSender → **Settings → Firmware → Flash Firmware** → select the `.hex` → start.
+
+ncSender puts the controller into update mode and flashes it for you.
+
+<!-- TODO image: ncSender update flow (same dialog as above is fine) -->
+
+---
+
+## ↩️ Restore the stock firmware
+
+Want to go back? Put the controller in **DFU mode** (Steps 2–3 above), then flash a stock
+backup from [`firmware/`](firmware/):
+```bash
+./scripts/restore-stock.sh          # restores v1.5.9 (or: restore-stock.sh 1.4.7)
+```
+
+---
+
+## 🛠️ Build from source (developers)
+
+```bash
+# tools: Python + PlatformIO + (for flashing) dfu-util
+pip install platformio
+
+# fetch pinned upstream grblHAL + apply the RTS-1 board files, then build
+cd grblhal-rts1 && ./setup.sh && cd STM32F4xx && pio run -e RTS1
+
+# flash the build you just made (controller in DFU mode):
+../../scripts/flash-grblhal.sh
+```
+**CI:** every push builds the firmware; pushing a `v*` tag publishes a **Release** with the
+`.bin` + `.hex` automatically (see [`.github/workflows/build.yml`](.github/workflows/build.yml)).
+
+---
+
+## 📚 Documentation
+- **[PIN_MAP.md](PIN_MAP.md)** — the recovered STM32F401 pin map + isolated-I/O (TCA9555).
+- **[HANDOFF.md](HANDOFF.md)** — bring-up status, design decisions, what's done / next.
+- **[DIAGNOSTICS.md](DIAGNOSTICS.md)** — the custom `$` diagnostic console commands.
+- **[MODBUS.md](MODBUS.md)** — VFD spindle setup (H-100 etc.).
+- **[RTS-X-UPDATE.md](RTS-X-UPDATE.md)** — RE notes for no-BOOT0 flashing (shelved, future).
+
+---
 
 ## Hardware
-- **MCU:** STM32F401RCT6 (Cortex-M4F, 256 KB flash / 64 KB RAM, LQFP64)
-- **Drivers:** 5× TI DRV8452 (STEP/DIR), 2.8 A RMS, up to 1/64 microstep — X, Y1, Y2, Z, A
-- **Spindle:** RS-485 Modbus VFD via ISL3485 transceiver (U5)
-- **I/O:** DB-25 = 8 isolated inputs + 4 isolated outputs; dedicated probe + toolsetter
-- **USB-C** CDC (ST default VID/PID 0483:5740). Power: 6-pin Molex Mini-Fit Jr.
-
-## Flashing access (fully unlocked)
-- **BOOT0 button** → STM32 ROM **DFU** bootloader (`0483:DF11`). No ST-Link needed.
-- **RDP Level 0** — flash freely readable/writable. Reversible.
-- Read:  `dfu-util -a 0 -s 0x08000000:0x40000 -U dump.bin`
-- Write: `dfu-util -a 0 -s 0x08000000:leave -D firmware.bin`
-- Flash layout: `[48 KB RTS bootloader @0x08000000]` + `[app + image-header @0x0800C000]`.
-  The bootloader validates the app (CRC + version in the header).
-
-## Flash / restore helper scripts (`scripts/`)
-Put the controller in DFU mode first (hold **BOOT0** while plugging in USB-C). Each
-script flashes, **verifies by read-back**, then boots — aborting if verification fails.
-- `scripts/flash-grblhal.sh` — flash the custom grblHAL build (build it first via `grblhal-rts1/setup.sh` + `pio run -e RTS1`).
-- `scripts/restore-stock.sh` — restore stock firmware (default **v1.5.9**; `restore-stock.sh 1.4.7` for the original dump).
-
-## Folders
-- **`firmware/`** — full 256 KB flash dumps (+ option bytes, checksums):
-  - `RTS-1_fw_v1.4.7_original_2026-06-11.bin` — first dump (original, pre-update)
-  - `RTS-1_fw_v1.5.9_2026-06-11.bin` — after the host app auto-updated it
-  - `option_bytes.bin` — 16 B option bytes (RDP=0xAA)
-- **`analysis/`** — Python/capstone disassembly scripts used to extract the pin map
-  (key: `init_decode2.py`; needs `../.venv`). Plus the older `PIN_MAP_draft.md`.
-- **`PIN_MAP.md`** — the recovered STM32F401 pin map (primary doc).
-- **`.venv/`** — Python venv with `capstone`, `pyserial`.
-
-## Firmware versions seen
-| Version | md5 | Note |
-|---|---|---|
-| v1.4.7 | 7a47f94e… | original dump |
-| v1.5.9 | 708d2e93… | after host-software auto-update; full app rewrite, bootloader unchanged |
-
-Stock firmware = closed FreeRTOS app, custom JSON (`msgType`) protocol over USB CDC.
-Host motion software pushes firmware updates via the RTS bootloader.
+- **MCU:** STM32F401RCT6 (Cortex-M4F, 256 KB flash / 64 KB RAM)
+- **Drivers:** 5× TI DRV8452 over SPI — X, Y1, Y2, Z, A
+- **Spindle:** RS-485 Modbus VFD (ISL3485)
+- **I/O:** isolated inputs + probe + tool-setter via a TCA9555 I²C expander; settings in an I²C EEPROM
+- **USB-C** CDC. **BOOT0** button → STM32 ROM DFU (fully unlocked, RDP level 0).
 
 ## Status
-Pin map ~90% recovered from firmware (see `PIN_MAP.md`). Flashing path de-risked
-(USB DFU). Remaining: STEP↔axis order, motor ENABLE pin, status-LED pin, then build
-the grblHAL STM32F4xx board map.
+Firmware is working and in testing: motors energize/home, probe + tool-setter, parking,
+all VFDs, persistent settings, and self-healing boot power-up. See **[HANDOFF.md](HANDOFF.md)**.
