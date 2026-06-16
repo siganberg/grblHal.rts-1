@@ -517,6 +517,10 @@ static status_code_t rts1_sys_command (sys_state_t state, char *line)
 #define DRV_UVLO_BIT    0x20
 
 static volatile bool rts1_vm_fault = false;
+static bool rts1_drv_configured = false;    // false until the DRV8452s verify EN_OUT on; until
+                                            // then rts1_realtime keeps (re)configuring them -
+                                            // self-heals a boot where the driver supply settled
+                                            // AFTER board_init ran (USB plugged in, PSU already on)
 static uint32_t rts1_poll_last = 0;
 static on_execute_realtime_ptr rts1_on_realtime = NULL;
 static control_signals_get_state_ptr rts1_get_state = NULL;
@@ -621,6 +625,27 @@ static void rts1_realtime (sys_state_t state)
                 rts1_dump_pins("@fault");           // nFAULT bank snapshot (chips still powered)
 #endif
                 hal.control.interrupt_callback(rts1_control_get_state());
+            } else if(!rts1_drv_configured) {
+                // Boot power-sequencing self-heal. If the driver supply wasn't stable
+                // when board_init() configured the DRV8452s (classically: USB plugged in
+                // while the PSU was already on), EN_OUT never latched and the motors are
+                // dark with NO fault - and stay dark until a reboot. Detect it (CTRL1 !=
+                // 0x8F while the chip is alive) and re-configure. No PC15 reset needed.
+                // Skip while moving so a (briefly de-energizing) reconfigure can't hit
+                // mid-cycle. Runs only until the drivers verify enabled, then never again.
+                uint8_t c1 = drv_read(0, 0x04);                 // CTRL1: 0x8F = EN_OUT on
+                if(c1 == 0x8F)
+                    rts1_drv_configured = true;                 // board_init succeeded
+                else if(c1 != 0x00 && !(state & (STATE_HOMING | STATE_JOG | STATE_CYCLE))) {
+                    bool ok = true;                             // alive but not enabled -> configure
+                    for(uint8_t i = 0; i < DRV_N; i++) {
+                        bool o = false;
+                        for(uint8_t t = 0; t < 4 && !o; t++) o = drv_configure(i);
+                        ok &= o;
+                    }
+                    if(ok) rts1_drv_configured = true;
+                }
+                // c1 == 0x00: chip dark (no VM / supply still ramping) -> wait for next poll
             }
         } else {
             // Faulted (VM lost). The e-stop cuts the DRIVERS' logic supply too, so
@@ -801,6 +826,12 @@ void board_init (void)
     HAL_GPIO_WritePin(GPIOA, GPIO_PIN_15, GPIO_PIN_RESET);   // MASTER ENABLE (active-low)
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);
+
+    // Let the driver supply rail settle after master-enable before SPI config. On a cold
+    // boot with USB plugged in while the PSU is already on, the DRV8452 logic supply lags
+    // the MCU; configuring too early misses EN_OUT. ~80 ms biases the first attempt to
+    // succeed; rts1_realtime self-heals if the rail is even slower (no reboot needed).
+    rts1_busywait(7200000);
 
     // Bring the five DRV8452 drivers out of Hi-Z and set their current (SPI).
     rts1_drv8452_init();
