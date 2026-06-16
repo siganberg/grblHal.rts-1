@@ -112,12 +112,47 @@ confirmed the TCA9555.) Active-low; read input ports 0/1 (reg 0x00, 2 bytes) = 1
   PROBE+TLS **tied** (`RTS1_PROBE_TIE_TLS`) — either contact triggers G38 / lights Probe.
 - **`$IEX`** = dump the 16 expander bits (probe-bit finder / input diagnostics).
 - Probe **macros work**: enabled `-D NGC_EXPRESSIONS_ENABLE=1` (ncSender probe blocks use
-  `#<vars>`/`[math]`). **Flash trade-off:** NGC + 2+ Modbus VFDs overflow the 256 KB
-  (the multi-spindle framework is ~36 KB), so VFDs trimmed to **H100 + on/off**
+  `#<vars>`/`[math]`). **Flash trade-off:** the USABLE code region is only **~224 KB**
+  (the ldscript reserves 16 KB for flash-NVS emulation, since `FLASH_ENABLE=1` when
+  `EEPROM_ENABLE=0`), and NGC filled it — so VFDs trimmed to **H100 + on/off**
   (`SPINDLE_ENABLE=192`, `N_SPINDLE=2`); `$DRV`/`$FPIN`/`$IDR`/`$IBIAS` diagnostics
-  removed/gated under `RTS1_DIAG` to reclaim flash. Build now ~87.5% flash.
+  removed/gated under `RTS1_DIAG`. Build ~99.9% of the 224 KB region.
+  - NOTE: each VFD driver is only **~1.6 KB** (an earlier "~36 KB multi-spindle
+    framework" note was an arithmetic error - measured against 256 KB, not the real
+    224 KB region). The real fix is the **I2C EEPROM** below: it frees the 16 KB sector
+    AND makes settings persist → fits ALL 7 VFDs + parking + diagnostics.
 - TODO here: map the other 8 isolated inputs (bits 0–7) + 4 outputs (bits 11–14);
   optional: register a *separate* grblHAL toolsetter (M6 auto tool-length) instead of tied.
+
+## I2C EEPROM → persistent NVS + reclaim 16 KB flash (PLANNED, needs hardware test)
+Two problems, one fix. (1) Settings don't persist (NVS is flash-emulation, unreliable
+here) so everything is baked as compiled defaults. (2) The ldscript reserves a 16 KB
+sector for that flash-NVS, capping usable code at 224 KB (we're maxed).
+
+The board has a **real I2C EEPROM** (stock uses it — "Error in EEPROM I2C" strings).
+RE'd from stock (fn @0x0800ee88): **I2C addr 0xA0 = 7-bit 0x50**, **16-bit memory
+addressing** (2-byte addr) + **32-byte page writes** → chip is **≥24C32 (≥4 KB)**.
+It's on **I2C1 (PB6/PB7)** — the SAME bus as the TCA9555 expander (0x27).
+
+Pointing grblHAL's NVS at it: set **`EEPROM_ENABLE=32`** (4 KB; safe on any ≥4 KB chip,
+grblHAL needs ~1–2 KB) + add `eeprom` to `lib_deps`. That auto-sets `FLASH_ENABLE=0`,
+so the ldscript's 16 KB EEPROM_EMUL sector becomes usable code → restore ALL VFDs
+(`SPINDLE_ENABLE` back to the full mask) + drop the runtime-bake hacks.
+
+**THE CATCH (why this needs care + a hardware test):** the grblHAL `eeprom` plugin uses
+grblHAL's own I2C driver (`Src/i2c.c`, DMA/IRQ), but our TCA9555 code uses a *separate*
+raw `HAL_I2C` handle (`rts1_i2c`). Two handles on one I2C1 peripheral = state conflict.
+Must pick ONE owner:
+  - **Option A (recommended):** let grblHAL own I2C1. Enable `I2C_ENABLE=1 I2C_PORT=1`
+    + `I2C1_ALT_PINMAP` (→ PB6/PB7 regular I2C1, not FMPI2C). Rework `rts1_tca_read` to
+    call grblHAL `i2c_receive(addr,buf,size,true)` (blocking) instead of `rts1_i2c`.
+    The eeprom plugin + TCA9555 then share one driver. ldscript: extend FLASH region to
+    reclaim EEPROM_EMUL (origin 0x8004000, len 256K-16K) and drop the `_EEPROM_Emul_*`
+    region refs (lines 47/51/52).
+  - Option B: keep raw HAL I2C, write a custom `hal.nvs` backend over our own EEPROM
+    read/write + force `FLASH_ENABLE=0`. More code, avoids the rework.
+**Do this with the controller ONLINE** — test incrementally: EEPROM read/write OK →
+settings persist across power-cycle → ldscript reclaim → restore VFDs. Don't flash blind.
 
 ## Open items / TODO
 - **Axis↔driver order + directions**: provisional. Verify by jogging.
