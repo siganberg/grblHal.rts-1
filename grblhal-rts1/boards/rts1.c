@@ -316,6 +316,39 @@ static void rts1_probe_init (void)
     }
 }
 
+// ===================== Parking defaults (baked at runtime) =====================
+// We want $41=1 (parking) + $57=500 (pull-out rate) + $59=3000 (fast rate) as
+// defaults. They can't be baked via DEFAULT_PARKING_* macros: config.h #errors when
+// DEFAULT_PARKING_ENABLE is combined with DEFAULT_HOMING_FORCE_SET_ORIGIN (our $22=79
+// bit 8). grblHAL has NO such guard at runtime (you can set both from the console),
+// so we bake them programmatically instead - equivalent to typing $41/$57/$59 each
+// boot, keeping $22=79 untouched. NVS doesn't persist here, so this IS our default.
+#define RTS1_PARKING_PULLOUT_RATE  500.0f      // $57 mm/min
+#define RTS1_PARKING_FAST_RATE     3000.0f     // $59 mm/min
+
+static on_settings_changed_ptr rts1_next_settings_changed = NULL;
+
+static void rts1_apply_parking (settings_t *s)
+{
+    s->parking.flags.enabled = On;                  // $41 = 1 (enable parking)
+    s->parking.pullout_rate  = RTS1_PARKING_PULLOUT_RATE;
+    s->parking.rate          = RTS1_PARKING_FAST_RATE;
+}
+
+static void rts1_on_settings_changed (settings_t *settings, settings_changed_flags_t changed)
+{
+    rts1_apply_parking(settings);                   // re-bake after $RST=$ / setting changes
+    if(rts1_next_settings_changed)
+        rts1_next_settings_changed(settings, changed);
+}
+
+static void rts1_parking_init (void)
+{
+    rts1_next_settings_changed = grbl.on_settings_changed;
+    grbl.on_settings_changed   = rts1_on_settings_changed;
+    rts1_apply_parking(&settings);                  // settings_init() already ran before board_init()
+}
+
 // ======================= Diagnostics (logging + $DRV) =======================
 // RTS1_DIAG=1 streams e-stop/recovery events to the console and dumps the live
 // DRV8452 registers at boot + on every fault transition, and enables the "$DRV"
@@ -448,23 +481,14 @@ static status_code_t rts1_sys_command (sys_state_t state, char *line)
         return Status_OK;
     }
 #endif
-    if(!strcmp(line, "IEX")) {                       // "$IEX": read TCA9555 isolated-input expander (probe-bit finder)
-        uint16_t v; char b[96]; uint8_t p = 0;
+    if(!strcmp(line, "IEX")) {                       // "$IEX": TCA9555 16-bit hex (active-low; probe=bit8, TLS=bit9)
+        uint16_t v; char b[40]; uint8_t p = 0;
         const char *h = "[MSG:IEX ="; while(*h) b[p++] = *h++;
         if(rts1_tca_read(&v)) {
             b[p++]=rts1_hexd[(v>>12)&0xF]; b[p++]=rts1_hexd[(v>>8)&0xF];
             b[p++]=rts1_hexd[(v>>4)&0xF];  b[p++]=rts1_hexd[v&0xF];
-            const char *lo = " low:"; while(*lo) b[p++] = *lo++;   // active (grounded) input bits
-            bool any = false;
-            for(int i = 0; i < 16; i++) if(!((v >> i) & 1)) {
-                b[p++] = ' ';
-                if(i >= 10) { b[p++] = '1'; b[p++] = (char)('0' + i - 10); }
-                else b[p++] = (char)('0' + i);
-                any = true;
-            }
-            if(!any) { b[p++] = ' '; b[p++] = '-'; }
         } else {
-            const char *e = "ERR (no I2C ack @0x27)"; while(*e) b[p++] = *e++;
+            const char *e = "ERR"; while(*e) b[p++] = *e++;
         }
         b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
         rts1_emit(b);
@@ -808,6 +832,9 @@ void board_init (void)
     // 8 inputs, 4 outputs). Init the bus, then route the probe bit into grblHAL.
     rts1_tca_init();
     rts1_probe_init();
+
+    // Bake parking defaults ($41=1, $57=500, $59=3000) at runtime - see rts1_parking_init.
+    rts1_parking_init();
 }
 
 #endif // BOARD_RTS1
