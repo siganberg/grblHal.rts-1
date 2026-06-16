@@ -15,3 +15,6 @@ grblhal/
 
 # Analysis convenience symlink to the stock dump (created for the capstone scripts)
 stock_RTS-1_backup.bin
+
+# Local scratch reverse-engineering helper scripts (not part of the build/release)
+.re/

@@ -221,6 +221,117 @@ static void rts1_drv8452_init (void)
     }
 }
 
+// ===================== TCA9555 isolated-I/O expander (I2C) =====================
+// All isolated DB-25 I/O (8 inputs + PROBE [J6] + tool-setter + the 4 outputs)
+// hangs off a TCA9555 16-bit I2C expander (U6) at 7-bit addr 0x27, on I2C1
+// (PB6=SCL, PB7=SDA, AF4). Stock reads input ports 0/1 (regs 0x00/0x01) = 16 bits.
+// We share grblHAL's I2C driver (i2c_transfer) so the bus is owned ONCE - the
+// I2C EEPROM (NVS @0x50) lives on the same bus. i2c_transfer does write-reg + read.
+#define RTS1_TCA_ADDR    0x27    // 7-bit I2C address (i2c_transfer shifts internally)
+#define RTS1_TCA_INPUT0  0x00    // input port 0 register (auto-increments to port 1)
+
+static void rts1_tca_init (void)
+{
+    i2c_start();    // init I2C1 (PB6/PB7); idempotent if the EEPROM/NVS layer already did
+}
+
+// Read the expander's 16 input bits (port0 = low byte, port1 = high byte).
+// Active-low: a grounded (triggered) input reads 0. Returns false on bus error.
+static bool rts1_tca_read (uint16_t *val)
+{
+    uint8_t buf[2];
+    i2c_transfer_t t = {0};
+    t.address         = RTS1_TCA_ADDR;
+    t.word_addr       = RTS1_TCA_INPUT0;    // register pointer written before the read
+    t.word_addr_bytes = 1;
+    t.count           = 2;
+    t.data            = buf;
+    if(!i2c_transfer(&t, true))             // read (blocking)
+        return false;
+    *val = (uint16_t)buf[0] | ((uint16_t)buf[1] << 8);
+    return true;
+}
+
+// ---- Isolated PROBE / tool-setter, read from the expander ----
+// Expander bit 8 = PROBE (J6), bit 9 = tool-setter; both active-low (0 = contact).
+// hal.probe.get_state is called from ISR context during a probe move, so it must
+// use the cached value (updated in rts1_realtime) - never touch I2C from there.
+#define RTS1_PROBE_BIT  8
+#define RTS1_TLS_BIT    9
+
+static volatile uint16_t rts1_iso = 0xFFFF;          // cached expander inputs (idle = all high)
+static uint32_t rts1_iso_last = 0;
+static bool rts1_probe_invert = false;               // is_probe_away ^ $6 (invert_probe_pin)
+static probe_configure_ptr rts1_next_probe_configure = NULL;
+
+static void rts1_probe_configure (bool is_probe_away, bool probing)
+{
+    rts1_probe_invert = is_probe_away ^ settings.probe.invert_probe_pin;
+    if(rts1_next_probe_configure)
+        rts1_next_probe_configure(is_probe_away, probing);
+}
+
+// Tie the tool-setter to the probe: with both on the same expander and no separate
+// grblHAL toolsetter pin, OR them so EITHER contact triggers G38 and lights the
+// Probe indicator (the "shared" mode). Set to 0 to use the probe (bit 8) alone.
+#define RTS1_PROBE_TIE_TLS  1
+
+static probe_state_t rts1_probe_get_state (void)
+{
+    probe_state_t s = {0};
+    s.connected = On;
+#if RTS1_PROBE_TIE_TLS
+    const uint16_t mask = (1u << RTS1_PROBE_BIT) | (1u << RTS1_TLS_BIT);
+    bool contact = (rts1_iso & mask) != mask;             // active-low: either bit 0 -> triggered
+#else
+    bool contact = !(rts1_iso & (1u << RTS1_PROBE_BIT));   // probe only
+#endif
+    s.triggered  = contact ^ rts1_probe_invert;
+    return s;
+}
+
+static void rts1_probe_init (void)
+{
+    if(hal.probe.get_state) {                         // probe HAL present (PROBE_ENABLE + aux claim)
+        rts1_next_probe_configure = hal.probe.configure;
+        hal.probe.configure = rts1_probe_configure;
+        hal.probe.get_state = rts1_probe_get_state;
+    }
+}
+
+// ===================== Parking defaults (baked at runtime) =====================
+// We want $41=1 (parking) + $57=500 (pull-out rate) + $59=3000 (fast rate) as
+// defaults. They can't be baked via DEFAULT_PARKING_* macros: config.h #errors when
+// DEFAULT_PARKING_ENABLE is combined with DEFAULT_HOMING_FORCE_SET_ORIGIN (our $22=79
+// bit 8). grblHAL has NO such guard at runtime (you can set both from the console),
+// so we bake them programmatically instead - equivalent to typing $41/$57/$59 each
+// boot, keeping $22=79 untouched. NVS doesn't persist here, so this IS our default.
+#define RTS1_PARKING_PULLOUT_RATE  500.0f      // $57 mm/min
+#define RTS1_PARKING_FAST_RATE     3000.0f     // $59 mm/min
+
+static on_settings_changed_ptr rts1_next_settings_changed = NULL;
+
+static void rts1_apply_parking (settings_t *s)
+{
+    s->parking.flags.enabled = On;                  // $41 = 1 (enable parking)
+    s->parking.pullout_rate  = RTS1_PARKING_PULLOUT_RATE;
+    s->parking.rate          = RTS1_PARKING_FAST_RATE;
+}
+
+static void rts1_on_settings_changed (settings_t *settings, settings_changed_flags_t changed)
+{
+    rts1_apply_parking(settings);                   // re-bake after $RST=$ / setting changes
+    if(rts1_next_settings_changed)
+        rts1_next_settings_changed(settings, changed);
+}
+
+static void rts1_parking_init (void)
+{
+    rts1_next_settings_changed = grbl.on_settings_changed;
+    grbl.on_settings_changed   = rts1_on_settings_changed;
+    rts1_apply_parking(&settings);                  // settings_init() already ran before board_init()
+}
+
 // ======================= Diagnostics (logging + $DRV) =======================
 // RTS1_DIAG=1 streams e-stop/recovery events to the console and dumps the live
 // DRV8452 registers at boot + on every fault transition, and enables the "$DRV"
@@ -233,6 +344,7 @@ static const char rts1_hexd[] = "0123456789ABCDEF";
 
 static void rts1_emit (const char *s) { if(hal.stream.write) hal.stream.write(s); }
 
+#if RTS1_DIAG
 // Append "0xNN" for a byte into buf at *p.
 static void rts1_puthex (char *buf, uint8_t *p, uint8_t v)
 {
@@ -265,6 +377,7 @@ static void rts1_dump_registers (void)
         rts1_emit(buf);
     }
 }
+#endif // RTS1_DIAG (rts1_puthex + rts1_dump_registers)
 
 // Read candidate fault/limit INPUT pins for nFAULT discovery ($PINS + an "@fault"
 // auto-snapshot). DRV8452 nFAULT asserts (open-drain LOW) on ANY driver fault, so
@@ -272,6 +385,7 @@ static void rts1_dump_registers (void)
 // driver fault bank. Excludes the driven straps (PA15/PB15/PC15 = outputs), CS
 // (PC0-4), SPI (PA5-7), STEP/DIR. Candidates are grblHAL-configured inputs
 // (limits PC5/6/7/PB4, auxin PC13/PC14).
+#if RTS1_DIAG
 static void rts1_dump_pins (const char *tag)
 {
     static const struct { char nm[5]; GPIO_TypeDef *port; uint16_t pin; } pins[] = {
@@ -290,6 +404,7 @@ static void rts1_dump_pins (const char *tag)
     buf[p++] = ']'; buf[p++] = '\r'; buf[p++] = '\n'; buf[p] = '\0';
     rts1_emit(buf);
 }
+#endif
 
 // Live stall monitor: streams X (driver 0) TRQ_COUNT + nFAULT(PC5) + FAULT reg at
 // 5 Hz, automatically WHILE HOMING OR JOGGING (silent at idle so commands aren't
@@ -343,12 +458,23 @@ static on_unknown_sys_command_ptr rts1_on_sys_command = NULL;
 
 static status_code_t rts1_sys_command (sys_state_t state, char *line)
 {
+#if RTS1_DIAG
     if(!strcmp(line, "DRV")) {                       // "$DRV": dump driver regs
         rts1_dump_registers();
         return Status_OK;
     }
-    if(!strcmp(line, "FPIN")) {                      // "$FPIN": dump candidate fault inputs
-        rts1_dump_pins(NULL);                        // ($PINS is a grblHAL built-in - shadowed)
+#endif
+    if(!strcmp(line, "IEX")) {                       // "$IEX": TCA9555 16-bit hex (active-low; probe=bit8, TLS=bit9)
+        uint16_t v; char b[40]; uint8_t p = 0;
+        const char *h = "[MSG:IEX ="; while(*h) b[p++] = *h++;
+        if(rts1_tca_read(&v)) {
+            b[p++]=rts1_hexd[(v>>12)&0xF]; b[p++]=rts1_hexd[(v>>8)&0xF];
+            b[p++]=rts1_hexd[(v>>4)&0xF];  b[p++]=rts1_hexd[v&0xF];
+        } else {
+            const char *e = "ERR"; while(*e) b[p++] = *e++;
+        }
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
         return Status_OK;
     }
     if(!strncmp(line, "MD", 2) && (line[2] == '=' || line[2] == '\0')) {  // "$MD=N": select monitored/tuned driver
@@ -391,6 +517,10 @@ static status_code_t rts1_sys_command (sys_state_t state, char *line)
 #define DRV_UVLO_BIT    0x20
 
 static volatile bool rts1_vm_fault = false;
+static bool rts1_drv_configured = false;    // false until the DRV8452s verify EN_OUT on; until
+                                            // then rts1_realtime keeps (re)configuring them -
+                                            // self-heals a boot where the driver supply settled
+                                            // AFTER board_init ran (USB plugged in, PSU already on)
 static uint32_t rts1_poll_last = 0;
 static on_execute_realtime_ptr rts1_on_realtime = NULL;
 static control_signals_get_state_ptr rts1_get_state = NULL;
@@ -452,6 +582,15 @@ static void rts1_realtime (sys_state_t state)
 {
     uint32_t now = hal.get_elapsed_ticks ? hal.get_elapsed_ticks() : 0;
 
+    // Poll the TCA9555 isolated inputs (probe/tool-setter/...) and cache them for
+    // the probe HAL, which runs in ISR context and must not block on I2C.
+    if(now - rts1_iso_last >= 2) {                   // ~500 Hz (I2C @400 kHz ~0.15 ms/read)
+        rts1_iso_last = now;
+        uint16_t v;
+        if(rts1_tca_read(&v))
+            rts1_iso = v;
+    }
+
 #if RTS1_DIAG
     static bool booted = false;                     // one-shot boot dump (stream up)
     if(!booted && now > 2500) {
@@ -486,6 +625,27 @@ static void rts1_realtime (sys_state_t state)
                 rts1_dump_pins("@fault");           // nFAULT bank snapshot (chips still powered)
 #endif
                 hal.control.interrupt_callback(rts1_control_get_state());
+            } else if(!rts1_drv_configured) {
+                // Boot power-sequencing self-heal. If the driver supply wasn't stable
+                // when board_init() configured the DRV8452s (classically: USB plugged in
+                // while the PSU was already on), EN_OUT never latched and the motors are
+                // dark with NO fault - and stay dark until a reboot. Detect it (CTRL1 !=
+                // 0x8F while the chip is alive) and re-configure. No PC15 reset needed.
+                // Skip while moving so a (briefly de-energizing) reconfigure can't hit
+                // mid-cycle. Runs only until the drivers verify enabled, then never again.
+                uint8_t c1 = drv_read(0, 0x04);                 // CTRL1: 0x8F = EN_OUT on
+                if(c1 == 0x8F)
+                    rts1_drv_configured = true;                 // board_init succeeded
+                else if(c1 != 0x00 && !(state & (STATE_HOMING | STATE_JOG | STATE_CYCLE))) {
+                    bool ok = true;                             // alive but not enabled -> configure
+                    for(uint8_t i = 0; i < DRV_N; i++) {
+                        bool o = false;
+                        for(uint8_t t = 0; t < 4 && !o; t++) o = drv_configure(i);
+                        ok &= o;
+                    }
+                    if(ok) rts1_drv_configured = true;
+                }
+                // c1 == 0x00: chip dark (no VM / supply still ramping) -> wait for next poll
             }
         } else {
             // Faulted (VM lost). The e-stop cuts the DRIVERS' logic supply too, so
@@ -667,6 +827,12 @@ void board_init (void)
     HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_15, GPIO_PIN_SET);
 
+    // Let the driver supply rail settle after master-enable before SPI config. On a cold
+    // boot with USB plugged in while the PSU is already on, the DRV8452 logic supply lags
+    // the MCU; configuring too early misses EN_OUT. ~80 ms biases the first attempt to
+    // succeed; rts1_realtime self-heals if the rail is even slower (no reboot needed).
+    rts1_busywait(7200000);
+
     // Bring the five DRV8452 drivers out of Hi-Z and set their current (SPI).
     rts1_drv8452_init();
 
@@ -675,6 +841,14 @@ void board_init (void)
 
     // Sensorless homing: clear the DRV8452 stall latch at the right points.
     rts1_homing_init();
+
+    // TCA9555 I2C expander: gateway to all isolated DB-25 I/O (probe, tool-setter,
+    // 8 inputs, 4 outputs). Init the bus, then route the probe bit into grblHAL.
+    rts1_tca_init();
+    rts1_probe_init();
+
+    // Bake parking defaults ($41=1, $57=500, $59=3000) at runtime - see rts1_parking_init.
+    rts1_parking_init();
 }
 
 #endif // BOARD_RTS1

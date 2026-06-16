@@ -100,33 +100,79 @@ CDC port (`lsof`→kill ncSender) and sends `$DFU` over serial (held-open fd, re
 `RTS1_FAST=1` skips read-back verify for quick iteration; `RTS1_NO_KILL=1` /
 `RTS1_NO_AUTODFU=1` to opt out. ncSender log dir: `~/Library/Application Support/ncSender/logs/`.
 
-## Sensorless stall homing - DONE (X/Y auto-square/Z working; A configured/untested)
-grblHAL's native sensorless homing is Trinamic-only, so this is a custom board module
-in `boards/rts1.c`. KEY HW FACT: **nFAULT is a SHARED line** (PC5, all 5 DRV8452s
-OR-tied) - so the hardware-pin path can't tell axes apart and breaks ganged-Y. Instead:
-- Enable DRV8452 stall per driver: `EN_STL` (CTRL4=0x59) + a 12-bit `STALL_TH`
-  (CTRL5/6). Stall latches `FAULT` reg (0x00) **bit2** and pulls nFAULT low.
-- **Override `hal.homing.get_state`** to read each homed axis's OWN driver stall over
-  SPI: axis->driver {X:0, Y1:1, Y2:2, Z:3, A:4}; Y1->`.a`, Y2->`.b` so grblHAL
-  auto-squares the gantry. (homeGetState reads GPIO directly, so override homing.get_
-  state, NOT limits.get_state.)
-- Latch-clear hooks (cycle start / each phase / completion) so pull-off + locate work.
-- Per-axis `STALL_TH`: X/Y/A=140 (belt), Z=230 (leadscrew - loaded TRQ ~140 vs no-load
-  ~300). Tune live with `$MD=<drv>` + `$STH=<val>` (RTS1_DIAG build); watch the 5Hz MON
-  stream. STALL_TH is speed-dependent - re-tune if you change `$24/$25`.
-- **No physical switches**: `hal.limits.get_state` is overridden to report limits CLEAR
-  (sender indicators stay green; the phantom pins were floating/shared-nFAULT).
-- Baked defaults (NVS doesn't persist): `$5`(invert, cosmetic now), `$22=79`, `$20=1`,
-  `$40=1`. Diagnostics gated behind `RTS1_DIAG` (=0 ships quiet; =1 for re-tuning).
+## Probe + isolated DB-25 I/O — DONE (TCA9555 I2C expander)
+**KEY DISCOVERY:** the 8 isolated inputs + PROBE + tool-setter + 4 outputs are NOT
+direct MCU pins — they hang off a **TCA9555 16-bit I2C I/O expander (U6, `PW555`)** on
+**I2C1 (PB6/PB7)** at addr **0x27**. (Found by: shorting probe changed no GPIO across
+all 4 ports → RE'd stock `SysInputTask` → `HAL_I2C` reads of 0x4E → board photos
+confirmed the TCA9555.) Active-low; read input ports 0/1 (reg 0x00, 2 bytes) = 16 bits.
+- **PROBE = expander bit 8** (DB-25 pin 22 / connector **J6**); **TLS = bit 9**.
+- `boards/rts1.c`: `rts1_tca_init` (blocking HAL I2C, 400 kHz), `rts1_realtime` polls +
+  caches at ~500 Hz, `hal.probe.get_state` overridden to read the cache (ISR-safe).
+  PROBE+TLS **tied** (`RTS1_PROBE_TIE_TLS`) — either contact triggers G38 / lights Probe.
+- **`$IEX`** = dump the 16 expander bits (probe-bit finder / input diagnostics).
+- Probe **macros work**: enabled `-D NGC_EXPRESSIONS_ENABLE=1` (ncSender probe blocks use
+  `#<vars>`/`[math]`). **Flash trade-off:** the USABLE code region is only **~224 KB**
+  (the ldscript reserves 16 KB for flash-NVS emulation, since `FLASH_ENABLE=1` when
+  `EEPROM_ENABLE=0`), and NGC filled it — so VFDs trimmed to **H100 + on/off**
+  (`SPINDLE_ENABLE=192`, `N_SPINDLE=2`); `$DRV`/`$FPIN`/`$IDR`/`$IBIAS` diagnostics
+  removed/gated under `RTS1_DIAG`. Build ~99.9% of the 224 KB region.
+  - NOTE: each VFD driver is only **~1.6 KB** (an earlier "~36 KB multi-spindle
+    framework" note was an arithmetic error - measured against 256 KB, not the real
+    224 KB region). The real fix is the **I2C EEPROM** below: it frees the 16 KB sector
+    AND makes settings persist → fits ALL 7 VFDs + parking + diagnostics.
+- TODO here: map the other 8 isolated inputs (bits 0–7) + 4 outputs (bits 11–14);
+  optional: register a *separate* grblHAL toolsetter (M6 auto tool-length) instead of tied.
+
+## I2C EEPROM → persistent NVS + reclaim 16 KB flash (DONE - hardware-confirmed)
+**DONE via Option A.** Settings now persist across power-cycles (`[NVS STORAGE:*EEPROM 4K]`;
+`$110=1234` survived two reboots) and the reclaimed 16 KB let us **restore ALL 7 VFDs**
+(`SPINDLE_ENABLE=1048830`, `N_SPINDLE=8`) - build 244.4 KB of the 240 KB region, ~1.3 KB
+free. Config: `EEPROM_ENABLE=32 I2C_ENABLE=1
+I2C_PORT=1 I2C1_ALT_PINMAP` + `eeprom` lib; `rts1_tca_read` reworked to grblHAL `i2c_transfer`
+(one I2C owner); custom `STM32F401RC_FLASH.ld` (installed by setup.sh) spans sectors 1-5.
+The original plan/notes follow for reference.
+
+Two problems, one fix. (1) Settings don't persist (NVS is flash-emulation, unreliable
+here) so everything is baked as compiled defaults. (2) The ldscript reserves a 16 KB
+sector for that flash-NVS, capping usable code at 224 KB (we're maxed).
+
+The board has a **real I2C EEPROM** (stock uses it — "Error in EEPROM I2C" strings).
+RE'd from stock (fn @0x0800ee88): **I2C addr 0xA0 = 7-bit 0x50**, **16-bit memory
+addressing** (2-byte addr) + **32-byte page writes** → chip is **≥24C32 (≥4 KB)**.
+It's on **I2C1 (PB6/PB7)** — the SAME bus as the TCA9555 expander (0x27).
+
+Pointing grblHAL's NVS at it: set **`EEPROM_ENABLE=32`** (4 KB; safe on any ≥4 KB chip,
+grblHAL needs ~1–2 KB) + add `eeprom` to `lib_deps`. That auto-sets `FLASH_ENABLE=0`,
+so the ldscript's 16 KB EEPROM_EMUL sector becomes usable code → restore ALL VFDs
+(`SPINDLE_ENABLE` back to the full mask) + drop the runtime-bake hacks.
+
+**THE CATCH (why this needs care + a hardware test):** the grblHAL `eeprom` plugin uses
+grblHAL's own I2C driver (`Src/i2c.c`, DMA/IRQ), but our TCA9555 code uses a *separate*
+raw `HAL_I2C` handle (`rts1_i2c`). Two handles on one I2C1 peripheral = state conflict.
+Must pick ONE owner:
+  - **Option A (recommended):** let grblHAL own I2C1. Enable `I2C_ENABLE=1 I2C_PORT=1`
+    + `I2C1_ALT_PINMAP` (→ PB6/PB7 regular I2C1, not FMPI2C). Rework `rts1_tca_read` to
+    call grblHAL `i2c_receive(addr,buf,size,true)` (blocking) instead of `rts1_i2c`.
+    The eeprom plugin + TCA9555 then share one driver. ldscript: extend FLASH region to
+    reclaim EEPROM_EMUL (origin 0x8004000, len 256K-16K) and drop the `_EEPROM_Emul_*`
+    region refs (lines 47/51/52).
+  - Option B: keep raw HAL I2C, write a custom `hal.nvs` backend over our own EEPROM
+    read/write + force `FLASH_ENABLE=0`. More code, avoids the rework.
+**Do this with the controller ONLINE** — test incrementally: EEPROM read/write OK →
+settings persist across power-cycle → ldscript reclaim → restore VFDs. Don't flash blind.
 
 ## Open items / TODO
 - **Axis↔driver order + directions**: provisional. Verify by jogging.
-- **A-axis homing**: configured (driver 4, STALL_TH=140) but untested (no A motor).
-- **NVS persistence**: settings don't survive reboot on their own (flash-NVS not
-  working?) - we baked the important defaults as a workaround. Worth fixing properly.
-- **E-stop = motor-power loss**: DONE via SPI UVLO poll + auto-recovery (see below).
-- **Modbus VFD (H100)**: scaffolded (MODBUS_ENABLE=2, all VFD types, DE on PA8). Being
-  RE'd from stock fw on the `modbus` branch. Verify VFD type + register map + DE timing.
+- **Homing is sensorless (no limit switches)**: stock uses DRV8452 stall detection
+  (`stall_thresholds`). grblHAL's native sensorless homing is Trinamic-only, so plan
+  is to map DRV8452 STALL outputs → grblHAL limit inputs. **Needs RE** (find stall
+  pins + threshold mechanism). The current limit pins (PC5/6/7, PB4) are GUESSES —
+  ignore the limit indicator colors for now; disable hard limits/homing (`$21=0 $22=0`).
+- **E-stop = motor-power loss** (no signal wire), sensed via ADC on **PA1 or PA4**
+  (VM voltage). Optional grblHAL plugin later: alarm on VM drop.
+- **Modbus VFD**: DE on PA8 (AUXOUTPUT1, MODBUS_DIR_AUX=1) — verify with a scope
+  during a Modbus frame; confirm VFD type (currently Huanyang) and `$` addr.
 - **Travel defaults** set: X440 Y440 Z110 (apply via `$RST=$` or `$130/$131/$132`).
 
 ## Recovered pin map (CORRECTED at bring-up via DRV8452 SPI RE)
@@ -136,7 +182,9 @@ OR-tied) - so the hardware-pin path can't tell axes apart and breaks ganged-Y. I
   SPI mode 1, 8-bit, MSB, /16. Interface strap: PC14 LOW = SPI.
 - Modbus: USART1 PA9/PA10, DE PA8 (ISL3485) | Spindle PWM: PA0 | USB: PA11/PA12
 - Master enable: **PA15 (active-LOW)** | board straps: PB15, PC15 (HIGH)
-- Limits/inputs (provisional, mis-reading — see TODO): PB4, PC5/6/7, PC13
+- Isolated inputs/probe/TLS: **TCA9555 I2C expander @0x27** (NOT GPIO — see section above).
+  Direct GPIO inputs: **PC5 = OR-tied DRV8452 nFAULT**, **PC13 = reset/e-stop**.
+  (There are NO limit switches — homing is sensorless via DRV8452 stall.)
   NOTE: prior map had DIR on PC0-4 and "enable" on PB1/5/9/12/14 — BOTH WRONG.
 
 ## Set up a new machine (e.g. garage laptop)

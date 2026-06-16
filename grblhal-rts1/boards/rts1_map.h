@@ -58,13 +58,21 @@
 #define M4_DIRECTION_PIN        9
 #endif
 
-// ============================ Limit inputs (PROVISIONAL) ============================
+// ============================ Limit inputs (no physical switches) ============================
+// This machine has NO limit switches - homing is sensorless via DRV8452 stall
+// (hal.homing.get_state reads STALL over SPI) and hal.limits.get_state is forced
+// clear in board_init(). So these limit pins are INERT placeholders; grblHAL still
+// needs them defined. They must NOT collide with real input functions:
+//   PC5 = OR-tied DRV8452 nFAULT (read in driver region) - leave as X "limit" sink.
+//   PC6, PC7 = the two real debounced switch inputs in stock fw = PROBE + TLS
+//             (RE: stock's input scanner @0x08010d80 polls PC6/PC7 with debounce).
+//             Repurposed below as PROBE (PC6) / toolsetter (PC7) - moved off limits.
 #define X_LIMIT_PORT            GPIOC
 #define X_LIMIT_PIN             5
 #define Y_LIMIT_PORT            GPIOC
-#define Y_LIMIT_PIN             6
+#define Y_LIMIT_PIN             9       // moved off PC6 (now PROBE); PC9 = unused/inert
 #define Z_LIMIT_PORT            GPIOC
-#define Z_LIMIT_PIN             7
+#define Z_LIMIT_PIN             10      // moved off PC7 (reserved for TLS); PC10 = unused/inert
 #define LIMIT_INMODE            GPIO_BITBAND
 
 #if N_ABC_MOTORS > 1
@@ -107,13 +115,16 @@
 #define SPINDLE_ENABLE_PIN      11
 #endif
 
-// ============================ Control + probe inputs (PROVISIONAL) ============================
+// ============================ Control + probe inputs ============================
 // NOTE: PB15 is a cooling fan driven by board_init() (active-low), NOT an input.
-// The tool-setter / second probe needs a different free pin (TBD at bring-up).
-#define AUXINPUT0_PORT          GPIOC   // Reset / E-stop
+// The REAL probe + tool-setter are isolated, read over I2C from the TCA9555 expander
+// (see boards/rts1.c / PIN_MAP.md) - NOT a GPIO. AUXINPUT1=PC6 below is a DUMMY pin
+// that just makes grblHAL build the probe HAL; board_init() overrides
+// hal.probe.get_state to read the expander (probe=bit8, TLS=bit9, tied).
+#define AUXINPUT0_PORT          GPIOC   // Reset / E-stop (PC13 - real GPIO)
 #define AUXINPUT0_PIN           13
-#define AUXINPUT1_PORT          GPIOC   // Probe
-#define AUXINPUT1_PIN           14
+#define AUXINPUT1_PORT          GPIOC   // Probe HAL stub (PC6 unused; real probe = TCA9555 bit 8)
+#define AUXINPUT1_PIN           6
 
 #if CONTROL_ENABLE & CONTROL_HALT
 #define RESET_PORT              AUXINPUT0_PORT

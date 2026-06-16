@@ -26,6 +26,9 @@ echo ">> Installing board map + board init ..."
 cp "$HERE/boards/rts1_map.h" boards/rts1_map.h
 cp "$HERE/boards/rts1.c"     boards/rts1.c
 
+echo ">> Installing custom linker script (reclaims the 16 KB flash-NVS sector; NVS is on the I2C EEPROM) ..."
+cp "$HERE/STM32F401RC_FLASH.ld" STM32F401RC_FLASH.ld
+
 echo ">> Wiring BOARD_RTS1 into Inc/driver.h ..."
 if ! grep -q 'BOARD_RTS1' Inc/driver.h; then
   python3 - "$PWD/Inc/driver.h" <<'PY'

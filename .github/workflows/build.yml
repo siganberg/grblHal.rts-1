@@ -1,0 +1,84 @@
+name: Build firmware
+
+# Builds the RTS-1 grblHAL firmware and produces both:
+#   - firmware .bin  (for BOOT0 / dfu-util initial flashing)
+#   - firmware .hex  (for ncSender's Flash Firmware tool / future updates)
+# On a version tag (e.g. v0.1.0) it also publishes a GitHub Release with both files.
+
+on:
+  push:
+    branches: [main, modbus]
+    tags:
+      - 'v*'
+      - '!v*-beta*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write        # needed to create the Release on tag builds
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0       # full history + tags so the tag annotation (release notes) is available
+          fetch-tags: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Set up grblHAL tree (fetch pinned upstream + apply RTS-1 board files)
+        working-directory: grblhal-rts1
+        run: ./setup.sh
+
+      - name: Build firmware (env RTS1)
+        working-directory: grblhal-rts1/STM32F4xx
+        run: pio run -e RTS1
+
+      - name: Package .bin + .hex
+        id: pkg
+        working-directory: grblhal-rts1/STM32F4xx
+        run: |
+          set -euo pipefail
+          BUILD=.pio/build/RTS1
+          OBJCOPY="$(find ~/.platformio/packages -name 'arm-none-eabi-objcopy' | head -1)"
+          "$OBJCOPY" -O ihex "$BUILD/firmware.elf" "$BUILD/firmware.hex"
+          # Version label: the tag on a release build, otherwise the short commit SHA.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then V="${GITHUB_REF_NAME}"; else V="$(git rev-parse --short HEAD)"; fi
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp "$BUILD/firmware.bin" "$GITHUB_WORKSPACE/dist/grblhal-rts1-${V}.bin"
+          cp "$BUILD/firmware.hex" "$GITHUB_WORKSPACE/dist/grblhal-rts1-${V}.hex"
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Built artifacts:"; ls -l "$GITHUB_WORKSPACE/dist"
+
+      - name: Upload build artifacts (every build)
+        uses: actions/upload-artifact@v4
+        with:
+          name: grblhal-rts1-${{ steps.pkg.outputs.version }}
+          path: dist/*
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag builds only)
+        if: github.ref_type == 'tag'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          # Release notes = the annotated tag's message (written by scripts/release.sh via Claude)
+          git tag -l --format='%(contents)' "$TAG" > release-notes.md
+          [ -s release-notes.md ] || echo "Release $TAG" > release-notes.md
+          gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --repo "${{ github.repository }}" \
+            --title "Release $TAG" \
+            --notes-file release-notes.md \
+            dist/*.bin dist/*.hex
