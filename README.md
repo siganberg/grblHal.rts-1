@@ -60,8 +60,7 @@ and locate the small **BOOT0** button on the board.
 The controller is now in **DFU mode** (it shows up as a *STM32 BOOTLOADER* /
 `0483:DF11` device). Nothing will light up like normal — that's expected.
 
-<!-- TODO image: BOOT0 held + USB plug-in, and/or the DFU device showing on the PC -->
-![Holding BOOT0 while connecting USB](docs/images/boot0-usb-dfu.png)
+![Holding BOOT0 while connecting USB](docs/images/boot0-usb-dfu.webp)
 
 ### Step 4 — Flash grblHAL
 Use **one** of these:
