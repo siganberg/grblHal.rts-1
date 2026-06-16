@@ -4,10 +4,13 @@ Open-source **[grblHAL](https://github.com/grblHAL)** firmware for the Onefinity
 **RTS-1 Open-Loop** controller (RealTime CNC / GSD RTS-1). It replaces the stock
 firmware so you can run the controller with grblHAL and senders like **ncSender**.
 
-> ⚠️ **Please read first.** Flashing replaces the stock firmware. It's reversible — the
-> original firmware is backed up in [`firmware/`](firmware/) and you can
-> [restore it](#-restore-the-stock-firmware) anytime — but follow the steps carefully.
-> You do this at your own risk.
+> ⚠️ **Please read first.** This is an **unofficial, community project** — **not** affiliated
+> with, endorsed by, or supported by RealTime CNC or Onefinity. Flashing replaces the stock
+> firmware; it's reversible (the original is backed up in [`firmware/`](firmware/) and you can
+> [restore it](#-restore-the-stock-firmware)), but **you do this entirely at your own risk.**
+> **I take no responsibility whatsoever** for any damage to your controller, machine, tools,
+> workpiece, or anything else, or for any loss arising from using this firmware, these scripts,
+> or these instructions. No warranty of any kind. If you're not comfortable with that, don't flash.
 
 ---
 
@@ -15,7 +18,6 @@ firmware so you can run the controller with grblHAL and senders like **ncSender*
 - Full **grblHAL** with all 4 axes (X, Y, Z, A) + **dual-Y auto-squaring** gantry.
 - **Probe + tool-setter**, **sensorless homing**, **parking**, and **probe macros**.
 - **All VFD types** (Huanyang, GS20, H-100, …) selectable in software — pick yours with `$395`.
-- **Settings that persist** across power cycles and reflashes.
 - Works with **ncSender** over USB-C.
 
 ---
@@ -26,7 +28,7 @@ firmware so you can run the controller with grblHAL and senders like **ncSender*
 - The latest firmware files from the **[Releases page](../../releases)**:
   - `grblhal-rts1-<version>.hex` — for ncSender's flashing tool
   - `grblhal-rts1-<version>.bin` — for manual DFU flashing
-- **First-time install only:** a small screwdriver to open the controller case (to reach
+- **First-time install only:** a **2.5 mm hex driver** to open the controller case (to reach
   the **BOOT0** button). After grblHAL is installed, future updates need **no opening**.
 
 ---
@@ -44,8 +46,8 @@ Go to the **[Releases page](../../releases)** and download the latest
 `grblhal-rts1-<version>.bin` (and `.hex`) to your computer.
 
 ### Step 2 — Open the case and find the BOOT0 button
-Power **off** the controller and unplug everything. Open the case and locate the small
-**BOOT0** button on the board.
+Power **off** the controller and unplug everything. Open the case (**2.5 mm hex driver**)
+and locate the small **BOOT0** button on the board.
 
 <!-- TODO image: photo of the controller board with the BOOT0 button circled -->
 ![BOOT0 button location](docs/images/boot0-button.png)
@@ -104,8 +106,13 @@ ncSender puts the controller into update mode and flashes it for you.
 
 ## ↩️ Restore the stock firmware
 
-Want to go back? Put the controller in **DFU mode** (Steps 2–3 above), then flash a stock
-backup from [`firmware/`](firmware/):
+Want to go back? The restore script and the original firmware backups live in **this
+repository**, so first **clone it** (one-time):
+```bash
+git clone https://github.com/siganberg/grblHal.rts-1.git
+cd grblHal.rts-1
+```
+Then put the controller in **DFU mode** (Steps 2–3 above) and run:
 ```bash
 ./scripts/restore-stock.sh          # restores v1.5.9 (or: restore-stock.sh 1.4.7)
 ```
@@ -133,11 +140,11 @@ uploads the artifacts for testing. See [`.github/workflows/build.yml`](.github/w
 ---
 
 ## 📚 Documentation
-- **[PIN_MAP.md](PIN_MAP.md)** — the recovered STM32F401 pin map + isolated-I/O (TCA9555).
-- **[HANDOFF.md](HANDOFF.md)** — bring-up status, design decisions, what's done / next.
-- **[DIAGNOSTICS.md](DIAGNOSTICS.md)** — the custom `$` diagnostic console commands.
-- **[MODBUS.md](MODBUS.md)** — VFD spindle setup (H-100 etc.).
-- **[RTS-X-UPDATE.md](RTS-X-UPDATE.md)** — RE notes for no-BOOT0 flashing (shelved, future).
+- **[docs/PIN_MAP.md](docs/PIN_MAP.md)** — the recovered STM32F401 pin map + isolated-I/O (TCA9555).
+- **[docs/HANDOFF.md](docs/HANDOFF.md)** — bring-up status, design decisions, what's done / next.
+- **[docs/DIAGNOSTICS.md](docs/DIAGNOSTICS.md)** — the custom `$` diagnostic console commands.
+- **[docs/MODBUS.md](docs/MODBUS.md)** — VFD spindle setup (H-100 etc.).
+- **[docs/RTS-X-UPDATE.md](docs/RTS-X-UPDATE.md)** — RE notes for no-BOOT0 flashing (shelved, future).
 
 ---
 
@@ -150,4 +157,4 @@ uploads the artifacts for testing. See [`.github/workflows/build.yml`](.github/w
 
 ## Status
 Firmware is working and in testing: motors energize/home, probe + tool-setter, parking,
-all VFDs, persistent settings, and self-healing boot power-up. See **[HANDOFF.md](HANDOFF.md)**.
+all VFDs, persistent settings, and self-healing boot power-up. See **[docs/HANDOFF.md](docs/HANDOFF.md)**.
