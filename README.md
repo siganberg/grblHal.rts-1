@@ -18,6 +18,7 @@ firmware so you can run the controller with grblHAL and senders like **ncSender*
 - Full **grblHAL** with all 4 axes (X, Y, Z, A) + **dual-Y auto-squaring** gantry.
 - **Probe + tool-setter**, **sensorless homing**, **parking**, and **probe macros**.
 - **All VFD types** (Huanyang, GS20, H-100, …) selectable in software — pick yours with `$395`.
+- **Smart status LED** that shows the controller's state at a glance — idle, busy, paused, or alarm.
 - Works with **ncSender** over USB-C.
 
 ---
@@ -96,6 +97,21 @@ machine starts in an **Alarm** state, that's normal (homing lock); click **Unloc
 2. ncSender → **Settings → Firmware → Flash Firmware** → select the `.hex` → start.
 
 ncSender puts the controller into update mode and flashes it for you.
+
+---
+
+## 🚦 Status LED (D5)
+
+The single green LED tells you the controller's state at a glance — a step up from the
+stock firmware, which only ever blinked at one steady rate:
+
+| LED pattern | What it means |
+|---|---|
+| **Solid on** | **Idle** — connected and ready to run |
+| **Slow blink** (~1×/sec) | **Busy** — running a job, jogging, or homing |
+| **Double-pulse** (blip-blip … pause) | **Paused** — feed hold or door open |
+| **Fast blink** (~5×/sec) | **Attention** — alarm or e-stop (needs homing/unlock, or a fault) |
+| **Off** | No power, or in DFU / flashing mode |
 
 ---
 

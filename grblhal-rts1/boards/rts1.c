@@ -616,11 +616,25 @@ static void rts1_realtime (sys_state_t state)
             rts1_iso = v;
     }
 
-    // Status LED (D5): blink ~1 Hz via expander bit 15, like stock (and off in DFU).
-    if(now - rts1_led_last >= 500) {
+    // Status LED (D5): the pattern conveys controller STATE (improves on stock's plain
+    // 1 Hz blink). Solid = idle/ready, slow blink = busy/moving, double-pulse = paused,
+    // fast blink = alarm/e-stop (needs attention). Off in DFU (bootloader never drives it).
+    if(now - rts1_led_last >= 25) {                      // re-evaluate pattern at ~40 Hz
         rts1_led_last = now;
-        rts1_led_on = !rts1_led_on;
-        rts1_tca_write(RTS1_TCA_OUTPUT1, rts1_led_on ? RTS1_LED_BYTE : 0x00);
+        bool led;
+        if(rts1_vm_fault || (state & (STATE_ALARM | STATE_ESTOP)))
+            led = (now % 200) < 100;                     // fast ~5 Hz: attention
+        else if(state & (STATE_HOLD | STATE_SAFETY_DOOR)) {
+            uint32_t p = now % 1000;                     // double-pulse: paused, waiting
+            led = (p < 120) || (p >= 240 && p < 360);
+        } else if(state & (STATE_CYCLE | STATE_JOG | STATE_HOMING | STATE_TOOL_CHANGE))
+            led = (now % 1000) < 500;                    // slow ~1 Hz: busy / moving
+        else
+            led = true;                                  // solid: idle / ready
+        if(led != rts1_led_on) {                         // write only on change (tiny I2C load)
+            rts1_led_on = led;
+            rts1_tca_write(RTS1_TCA_OUTPUT1, led ? RTS1_LED_BYTE : 0x00);
+        }
     }
 
 #if RTS1_DIAG
