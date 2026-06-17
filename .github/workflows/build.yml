@@ -73,9 +73,12 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${GITHUB_REF_NAME}"
-          # Release notes = the annotated tag's message (written by scripts/release.sh via Claude)
-          git tag -l --format='%(contents)' "$TAG" > release-notes.md
-          [ -s release-notes.md ] || echo "Release $TAG" > release-notes.md
+          # Release notes = the ANNOTATED tag's message (written by scripts/release.sh via Claude).
+          # Re-fetch the annotated tag object first, otherwise `git tag --format='%(contents)'`
+          # falls back to the commit message (which is what made v0.1.2's notes wrong).
+          git fetch origin tag "$TAG" --force
+          TAG_MESSAGE=$(git tag -l --format='%(contents)' "$TAG" 2>/dev/null || true)
+          if [ -n "$TAG_MESSAGE" ]; then echo "$TAG_MESSAGE" > release-notes.md; else echo "Release $TAG" > release-notes.md; fi
           gh release delete "$TAG" --repo "${{ github.repository }}" --yes 2>/dev/null || true
           gh release create "$TAG" \
             --repo "${{ github.repository }}" \
