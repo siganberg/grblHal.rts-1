@@ -47,6 +47,7 @@ Expander bit map (found with `$IEX` while shorting each connector):
 | **8** | **PROBE** (DB-25 pin 22 / connector **J6**) | active-low |
 | **9** | **tool-setter / TLS** | active-low |
 | 11–14 | the 4 isolated OUTPUTS (OUT0–3, CPC1017N) | |
+| **15** | **status LED (D5)** — expander OUTPUT, blinked ~1 Hz | off in DFU |
 
 grblHAL integration (`boards/rts1.c`): `rts1_realtime` polls the expander ~500 Hz over
 I2C and caches it (`rts1_iso`); `hal.probe.get_state` is overridden to read the cache
@@ -58,8 +59,9 @@ the status report — see `RTS1_PROBE_TIE_TLS`. Diagnostic: **`$IEX`** dumps the
 **PA15** = master enable (active-LOW: rail + fans). **PB15** = driver strap (hold HIGH;
 toggling audibly disrupts steppers). **PC15** = DRV8452 nSLEEP/reset. **PC14** = SPI
 interface strap (LOW = SPI mode). **PC13** = reset / e-stop input. **PC5** = OR-tied
-DRV8452 nFAULT. Status-LED pin is timer-driven (not a software GPIO) — unidentified,
-deprioritized.
+DRV8452 nFAULT. **Status LED (D5)** is NOT an MCU pin — it's **TCA9555 bit 15** (an
+expander output), which is why the GPIO-toggle hunt found nothing. Implemented: config1
+makes bit 15 an output, `rts1_realtime` blinks it ~1 Hz over I2C (off in DFU, like stock).
 
 ## Corrections vs the original recovered map (above)
 - DIR is **PB1/5/9/12/14**, not PC0–4 (PC0–4 are the SPI **CS** lines). STEP = PB0/2/8/10/13.
@@ -69,7 +71,6 @@ deprioritized.
 
 ## Open items
 1. Map the remaining expander bits: the 8 isolated inputs (bits 0–7) and 4 outputs (11–14).
-2. Status-LED pin (timer-driven, low priority).
 
 ## Flashing (recap)
 USB DFU via BOOT0 button, RDP0. `dfu-util -a 0 -s 0x08000000:leave -D grblHAL.bin`.

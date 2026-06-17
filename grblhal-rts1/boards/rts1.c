@@ -229,10 +229,33 @@ static void rts1_drv8452_init (void)
 // I2C EEPROM (NVS @0x50) lives on the same bus. i2c_transfer does write-reg + read.
 #define RTS1_TCA_ADDR    0x27    // 7-bit I2C address (i2c_transfer shifts internally)
 #define RTS1_TCA_INPUT0  0x00    // input port 0 register (auto-increments to port 1)
+#define RTS1_TCA_OUTPUT1 0x03    // output port 1 register (bits 8..15)
+#define RTS1_TCA_CONFIG1 0x07    // configuration port 1 (1 = input, 0 = output)
+// Status LED (D5) = expander port-1 bit 7 (= overall bit 15), an OUTPUT. Stock blinks it
+// ~1 Hz over this same expander (RE: config1=0x07 makes bits 11..15 outputs, output1 bit7
+// toggled by a counter). We drive ONLY bit 15 - leaving the 4 isolated outputs (bits
+// 11..14 = the CPC1017N relays) as inputs/undriven. Off in DFU for free (the ROM
+// bootloader never talks to the expander), matching stock.
+#define RTS1_LED_BYTE    0x80    // port-1 bit 7 set = LED on
+
+// Write one expander register (blocking). Returns false on bus error.
+static bool rts1_tca_write (uint8_t reg, uint8_t val)
+{
+    i2c_transfer_t t = {0};
+    t.address         = RTS1_TCA_ADDR;
+    t.word_addr       = reg;
+    t.word_addr_bytes = 1;
+    t.count           = 1;
+    t.data            = &val;
+    return i2c_transfer(&t, false);          // write (blocking)
+}
 
 static void rts1_tca_init (void)
 {
     i2c_start();    // init I2C1 (PB6/PB7); idempotent if the EEPROM/NVS layer already did
+    // Make ONLY port-1 bit 7 (status LED) an output; everything else stays input.
+    rts1_tca_write(RTS1_TCA_CONFIG1, 0x7F);          // bit7=0 output, bits0..6=1 input
+    rts1_tca_write(RTS1_TCA_OUTPUT1, RTS1_LED_BYTE); // LED on at boot (matches stock)
 }
 
 // Read the expander's 16 input bits (port0 = low byte, port1 = high byte).
@@ -261,6 +284,8 @@ static bool rts1_tca_read (uint16_t *val)
 
 static volatile uint16_t rts1_iso = 0xFFFF;          // cached expander inputs (idle = all high)
 static uint32_t rts1_iso_last = 0;
+static uint32_t rts1_led_last = 0;                   // status LED (D5) ~1 Hz blink timer
+static bool     rts1_led_on = true;
 static bool rts1_probe_invert = false;               // is_probe_away ^ $6 (invert_probe_pin)
 static probe_configure_ptr rts1_next_probe_configure = NULL;
 
@@ -589,6 +614,13 @@ static void rts1_realtime (sys_state_t state)
         uint16_t v;
         if(rts1_tca_read(&v))
             rts1_iso = v;
+    }
+
+    // Status LED (D5): blink ~1 Hz via expander bit 15, like stock (and off in DFU).
+    if(now - rts1_led_last >= 500) {
+        rts1_led_last = now;
+        rts1_led_on = !rts1_led_on;
+        rts1_tca_write(RTS1_TCA_OUTPUT1, rts1_led_on ? RTS1_LED_BYTE : 0x00);
     }
 
 #if RTS1_DIAG
