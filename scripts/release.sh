@@ -81,8 +81,8 @@ Required format:
 Rules:
 1. Start with exactly \"## What's Changed\"
 2. Group by category with emojis (e.g. :rocket: New Features, :bug: Bug Fixes, :wrench: Improvements)
-3. Write from the USER's perspective - describe what they can now do or what was fixed for them, not internal code details
-4. SKIP commits that are purely internal (test updates, refactors, CI fixes, code cleanup) - users do not care about these
+3. Write from the MACHINE OWNER's perspective - describe what the controller now does, or what was fixed for them on the machine, in plain non-technical language. No pin names, chips, registers, file names, or code details.
+4. SKIP anything that is not a change the user notices when running their machine. Drop: refactors, test updates, CI/build/release tooling, code cleanup, documentation/README changes, licensing, repository housekeeping, and pure reverse-engineering notes. Keep only firmware features, behavior changes, and bug fixes the user experiences.
 5. If multiple commits relate to the same user-facing change, combine them into a single bullet point
 6. Do NOT fabricate changes that are not in the commit list
 7. No markdown code blocks, URLs, links, or non-English characters
@@ -90,7 +90,7 @@ Rules:
 
 Output ONLY the markdown. No preamble. No explanation. Just the markdown."
 
-RELEASE_NOTES=$(claude -p --system-prompt "You are a release note generator for grblHAL firmware for the Onefinity RTS-1 CNC controller. Write notes for end users (machine owners), not developers. Only use the commit messages provided. Never invent changes. Skip internal-only changes like test fixes, refactors, and CI updates." "$PROMPT" 2>&1)
+RELEASE_NOTES=$(claude -p --system-prompt "You are a release-note generator for grblHAL firmware that runs on the Onefinity RTS-1 CNC controller. Write for machine owners (end users) in plain, non-technical language - describe only what the controller now does or what was fixed for them on their machine. Skip everything internal or behind-the-scenes: refactors, tests, CI, build/release tooling, documentation/README, licensing, and reverse-engineering notes. Never mention pins, chips, registers, or file names. Only use the commit messages provided; never invent changes." "$PROMPT" 2>&1)
 CLAUDE_EXIT_CODE=$?
 
 if [ $CLAUDE_EXIT_CODE -ne 0 ] || [ -z "$RELEASE_NOTES" ]; then
