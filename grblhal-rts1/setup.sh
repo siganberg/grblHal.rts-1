@@ -29,6 +29,25 @@ cp "$HERE/boards/rts1.c"     boards/rts1.c
 echo ">> Installing custom linker script (reclaims the 16 KB flash-NVS sector; NVS is on the I2C EEPROM) ..."
 cp "$HERE/STM32F401RC_FLASH.ld" STM32F401RC_FLASH.ld
 
+echo ">> Installing Redline VFD driver + registering it in vfd_init() ..."
+cp "$HERE/spindle/redline.c" spindle/vfd/redline.c
+if ! grep -q 'vfd_redline_init' spindle/vfd/spindle.c; then
+  python3 - "$PWD/spindle/vfd/spindle.c" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+anchor = ('#if SPINDLE_ENABLE & (1<<SPINDLE_NOWFOREVER)\n'
+          '        extern void vfd_nowforever_init (void);\n'
+          '        vfd_nowforever_init();\n'
+          '#endif\n')
+ins = anchor + ('\n#if SPINDLE_ENABLE & (1<<SPINDLE_MY_SPINDLE)\n'
+                '        extern void vfd_redline_init (void);\n'
+                '        vfd_redline_init();\n'
+                '#endif\n')
+assert anchor in s, "nowforever anchor not found in spindle.c"
+open(p, 'w').write(s.replace(anchor, ins, 1))
+PY
+fi
+
 echo ">> Wiring BOARD_RTS1 into Inc/driver.h ..."
 if ! grep -q 'BOARD_RTS1' Inc/driver.h; then
   python3 - "$PWD/Inc/driver.h" <<'PY'
