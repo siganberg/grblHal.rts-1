@@ -54,6 +54,16 @@
 #define REDLINE_CMD_REV       2
 #define REDLINE_CMD_STOP      6
 #define REDLINE_SETPOINT_FULL 10000.0f  // 0xA001 value at 100 % of max RPM
+#define REDLINE_READBACK_FULL 3998.5f   // 0x9000 value at rated RPM (bench-calibrated,
+                                        // ~0.1 Hz units: 3998.5 ~= 400 Hz = rated RPM)
+
+// Locked profile: the Redline spindle kit is a fixed configuration, so these are
+// pinned in firmware (not user settings) to keep it plug-and-play and prevent
+// accidental changes. rated RPM locks $30/$31 (cap.rpm_range_locked); the kit always
+// ships at Modbus address 1.
+#define REDLINE_RATED_RPM     24000.0f  // 80 mm 1.5/2.2 kW spindle = 24000 RPM @ 400 Hz
+#define REDLINE_MIN_RPM       0.0f
+#define REDLINE_MODBUS_ADDR   1
 
 static uint32_t modbus_address, max_freq = 0, exceptions = 0;
 static spindle_id_t spindle_id = -1;
@@ -95,15 +105,16 @@ static void get_max_freq (void *data)
     modbus_send(&cmd, &callbacks, true);
 }
 
-// Convert a raw readback word (reg 0x9000) to RPM.
-// The setpoint scale (0..REDLINE_SETPOINT_FULL) is used as a fallback until the VFD's
-// max frequency has been read, then readback is (freq / max_freq) * rpm_max.
+// Convert a raw readback word (reg 0x9000) to RPM. The readback maxes out at
+// REDLINE_READBACK_FULL at the spindle's rated RPM ($30), so
+// rpm = f * rpm_max / REDLINE_READBACK_FULL. (Bench-calibrated; equivalent to the
+// MODVFD readback out_multiplier = $30 / out_divider = 3998.5.) The 0x0007 max-freq
+// read is kept only as a liveness/ready handshake (see get_max_freq), not for scaling.
 static float f2rpm (uint16_t f)
 {
     float rpm_max = spindle_hal ? spindle_hal->rpm_max : 0.0f;
-    float scale = max_freq ? (float)max_freq : REDLINE_SETPOINT_FULL;
 
-    return ((float)f / scale) * rpm_max;
+    return (float)f * rpm_max / REDLINE_READBACK_FULL;
 }
 
 static bool spindleConfig (spindle_ptrs_t *spindle)
@@ -286,8 +297,12 @@ static void onSpindleSelected (spindle_ptrs_t *spindle)
         spindle_data.rpm_programmed = -1.0f;
         vfd_atspeed_configure((spindle_hal = spindle), &spindle_data);
 
+        // Locked profile: pin the RPM range (ignores $30/$31) and Modbus address.
+        spindle->rpm_max = REDLINE_RATED_RPM;
+        spindle->rpm_min = REDLINE_MIN_RPM;
+
         modbus_set_silence(NULL);
-        modbus_address = vfd_get_modbus_address(spindle_id);
+        modbus_address = REDLINE_MODBUS_ADDR;
 
         get_max_freq(NULL);
 
@@ -316,7 +331,8 @@ void vfd_redline_init (void)
                 .variable = On,
                 .at_speed = On,
                 .direction = On,
-                .cmd_controlled = On
+                .cmd_controlled = On,
+                .rpm_range_locked = On   // $30/$31 owned by the driver (rated RPM), not the user
             },
             .config = spindleConfig,
             .set_state = spindleSetState,
