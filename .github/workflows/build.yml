@@ -39,23 +39,29 @@ jobs:
         working-directory: grblhal-rts1
         run: ./setup.sh
 
-      - name: Build firmware (env RTS1)
+      - name: Build firmware (both variants)
         working-directory: grblhal-rts1/STM32F4xx
-        run: pio run -e RTS1
+        run: pio run -e RTS1 -e RTS1_LIMITSW
 
-      - name: Package .bin + .hex
+      - name: Package .bin + .hex (stall + limit-switch variants)
         id: pkg
         working-directory: grblhal-rts1/STM32F4xx
         run: |
           set -euo pipefail
-          BUILD=.pio/build/RTS1
           OBJCOPY="$(find ~/.platformio/packages -name 'arm-none-eabi-objcopy' | head -1)"
-          "$OBJCOPY" -O ihex "$BUILD/firmware.elf" "$BUILD/firmware.hex"
           # Version label: the tag on a release build, otherwise the short commit SHA.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then V="${GITHUB_REF_NAME}"; else V="$(git rev-parse --short HEAD)"; fi
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          cp "$BUILD/firmware.bin" "$GITHUB_WORKSPACE/dist/grblhal-rts1-${V}.bin"
-          cp "$BUILD/firmware.hex" "$GITHUB_WORKSPACE/dist/grblhal-rts1-${V}.hex"
+          # env -> release-name suffix. Default (stall homing) has no suffix; the
+          # physical home/limit-switch variant gets "-limitsw".
+          package() {
+            local build=".pio/build/$1" suffix="$2"
+            "$OBJCOPY" -O ihex "$build/firmware.elf" "$build/firmware.hex"
+            cp "$build/firmware.bin" "$GITHUB_WORKSPACE/dist/grblhal-rts1${suffix}-${V}.bin"
+            cp "$build/firmware.hex" "$GITHUB_WORKSPACE/dist/grblhal-rts1${suffix}-${V}.hex"
+          }
+          package RTS1 ""
+          package RTS1_LIMITSW "-limitsw"
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Built artifacts:"; ls -l "$GITHUB_WORKSPACE/dist"
 

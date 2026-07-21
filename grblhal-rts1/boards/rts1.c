@@ -81,6 +81,13 @@ static rts1_current_settings_t rts1_current = { .run_ma = { [0 ... N_AXIS-1] = R
 #define RTS1_STALL_TH_Z  230     // Z (leadscrew) - needs higher (loaded TRQ ~140 vs no-load ~300)
 #define RTS1_CTRL4_STALL 0x59    // CTRL4 = default 0x49 | EN_STL(0x10); keeps STL_REP=1
 
+// ---- Homing source: 0 = DRV8452 sensorless stall (default), 1 = physical home/limit
+// switches on the DB-25 isolated inputs 1-5 (X, Y1, Y2, Z, A), active-low to IGND.
+// The [env:RTS1_LIMITSW] PlatformIO env builds the switch variant as a separate binary.
+#ifndef RTS1_HOME_SWITCHES
+#define RTS1_HOME_SWITCHES 0
+#endif
+
 #define DRV_N        5
 #define DRV_CS_MASK  (GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4)
 
@@ -822,9 +829,18 @@ static limit_signals_t rts1_limits_get_state (void)
     return (limit_signals_t){0};
 }
 
-// Per-driver SPI stall read for the homed axes. .a = primary motor; .b = second motor
-// of an auto-squared axis (Y2 = driver 2). Rate-limited to one read per ms (the stall
-// LATCHES, so this can't miss it). When not homing, defers to the GPIO home reader.
+#if RTS1_HOME_SWITCHES
+// DB-25 isolated input bit for each axis's home switch (active-low, switch to IGND).
+// Pins 1-5 -> bits 0-4: X=1/0, Y1=2/1, Y2=3/2, Z=4/3, A=5/4.
+static const uint8_t rts1_home_bit[N_AXIS] = { 0, 1, 3, 4 };  // X, Y1, Z, A
+#define RTS1_HOME_BIT_Y2  2                                    // Y2 (pin 3) for auto-square
+#endif
+
+// Home-signal read for the homed axes. .a = primary motor; .b = second motor of an
+// auto-squared axis (Y2). Rate-limited to one read per ms. When not homing, defers to
+// the GPIO home reader. Source is the DRV8452 SPI stall bit, or - in the RTS1_LIMITSW
+// build - the TCA9555 isolated inputs (physical switches). Both allow blocking I/O here
+// (this is not called from ISR context).
 static home_signals_t rts1_homing_get_state (void)
 {
     if(!rts1_homing_active)
@@ -836,6 +852,19 @@ static home_signals_t rts1_homing_get_state (void)
     if(now != last) {
         last = now;
         home_signals_t s = {0};
+#if RTS1_HOME_SWITCHES
+        uint16_t v;
+        if(rts1_tca_read(&v)) for(uint8_t a = 0; a < N_AXIS; a++) {
+            if(!(rts1_homing_axes.mask & (1u << a)))
+                continue;
+            if(!(v & (1u << rts1_home_bit[a])))          // active-low: switch closed -> bit 0 -> triggered
+                s.a.mask |= (1u << a);
+#if Y_AUTO_SQUARE
+            if(a == Y_AXIS && !(v & (1u << RTS1_HOME_BIT_Y2)))
+                s.b.mask |= (1u << a);               // Y second switch (pin 3) for auto-square
+#endif
+        }
+#else
         for(uint8_t a = 0; a < N_AXIS; a++) {
             if(!(rts1_homing_axes.mask & (1u << a)))
                 continue;
@@ -846,6 +875,7 @@ static home_signals_t rts1_homing_get_state (void)
                 s.b.mask |= (1u << a);               // Y second motor (driver 2) for auto-square
 #endif
         }
+#endif
         cache = s;
     }
     return cache;
