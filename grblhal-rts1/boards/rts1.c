@@ -27,6 +27,7 @@
 */
 
 #include "driver.h"
+#include "grbl/nvs_buffer.h"
 
 #if defined(BOARD_RTS1)
 
@@ -40,6 +41,18 @@
 #define RTS1_DRV_RUN_CURRENT   0xA0   // CTRL11 TRQ_DAC (move)  ~1.76 A (lowered from 0xC0 for quieter+cooler)
 #define RTS1_DRV_HOLD_CURRENT  0x40   // CTRL10 ISTSL  (idle)   ~0.75 A target
 #define RTS1_DRV_MICROSTEP     0x06   // CTRL2 low nibble: 0x06 = 1/16 (stock); $100-102 = 320/320/800
+
+// ---- Per-axis run current, adjustable via $140-$143 (Setting_AxisStepperCurrent,
+// the standard grblHAL per-axis motor-current setting; unused by the core and by us
+// for the DRV8452 since we're not Trinamic). Value is approximate mA -> DRV8452
+// TRQ_DAC (CTRL11) code 0..255, where 0xFF ~= 2.8 A full scale (board estimate,
+// uncalibrated - tune by motor temperature). Lets e.g. the A axis run a NEMA 17 at a
+// lower current than the XYZ NEMA 23s. Persisted in the I2C EEPROM. ----
+#define RTS1_CURRENT_FULLSCALE_MA 2800     // TRQ_DAC 0xFF ~= 2.8 A (board estimate)
+#define RTS1_DEFAULT_CURRENT_MA   1750     // ~0xA0, matches the previous fixed run current
+
+typedef struct { uint16_t run_ma[N_AXIS]; } rts1_current_settings_t;
+static rts1_current_settings_t rts1_current = { .run_ma = { [0 ... N_AXIS-1] = RTS1_DEFAULT_CURRENT_MA } };
 
 // ---- Silent step decay (DRV8452 "EN_SS"): StealthChop-style voltage-mode PWM for
 // noiseless operation at standstill + low speed. Auto-transitions back to the CTRL1
@@ -121,6 +134,18 @@ static bool drv_cfg_reg (uint8_t i, uint8_t reg, uint8_t data)
     return false;
 }
 
+// Driver order is 0=X 1=Y1 2=Y2 3=Z 4=A, so each driver maps to a logical axis for
+// the per-axis run-current lookup (Y1 and Y2 share the Y-axis current).
+static const uint8_t rts1_drv_axis[DRV_N] = { X_AXIS, Y_AXIS, Y_AXIS, Z_AXIS, A_AXIS };
+
+// DRV8452 TRQ_DAC (CTRL11) code 0..255 for driver i, from that axis's $140-$143 (mA).
+static uint8_t rts1_run_code (uint8_t i)
+{
+    uint32_t ma = rts1_current.run_ma[rts1_drv_axis[i]];
+    uint32_t code = (ma * 255u + RTS1_CURRENT_FULLSCALE_MA / 2u) / RTS1_CURRENT_FULLSCALE_MA;
+    return code > 255u ? 255u : (uint8_t)code;
+}
+
 // Configure one driver. EVERY config register is read-back verified (a garbled
 // current/microstep/decay frame previously slipped through and caused a driver
 // to run loud or fault under load). EN_OUT is enabled last.
@@ -132,7 +157,7 @@ static bool drv_configure (uint8_t i)
     ok &= drv_cfg_reg(i, 0x06, 0x3C);                   // CTRL3 : unlock + OCP config
     ok &= drv_cfg_reg(i, 0x04, 0x0F);                   // CTRL1 : TOFF/DECAY, EN_OUT=0
     ok &= drv_cfg_reg(i, 0x05, RTS1_DRV_MICROSTEP);     // CTRL2 : microstep, ext STEP/DIR
-    ok &= drv_cfg_reg(i, 0x0E, RTS1_DRV_RUN_CURRENT);   // CTRL11: TRQ_DAC run current
+    ok &= drv_cfg_reg(i, 0x0E, rts1_run_code(i));       // CTRL11: TRQ_DAC run current ($140-$143)
     ok &= drv_cfg_reg(i, 0x0D, RTS1_DRV_HOLD_CURRENT);  // CTRL10: ISTSL hold current
 #if RTS1_STALL_AXES
     if(RTS1_STALL_AXES & (1u << i)) {                    // enable stall detection (sensorless homing)
@@ -853,6 +878,83 @@ static void rts1_homing_init (void)
     grbl.on_homing_completed = rts1_homing_completed;
 }
 
+// ===================== Per-axis run current ($140-$143) =====================
+// Standard grblHAL Setting_AxisStepperCurrent, implemented for the DRV8452 (we're
+// not Trinamic, so the core leaves $140-$143 to the driver). Persisted in EEPROM;
+// applied to the drivers over SPI at load and on change. See RTS1_CURRENT_* above.
+static nvs_address_t rts1_current_nvs;
+
+static void rts1_apply_current (void)
+{
+    for(uint8_t i = 0; i < DRV_N; i++)
+        drv_write(i, 0x0E, rts1_run_code(i));               // CTRL11 TRQ_DAC, live
+}
+
+static status_code_t rts1_set_current (setting_id_t setting, uint_fast16_t value)
+{
+    uint_fast8_t idx;
+    settings_get_axis_base(setting, &idx);
+    if(idx >= N_AXIS)
+        return Status_SettingValueOutOfRange;
+    rts1_current.run_ma[idx] = (uint16_t)value;
+    rts1_apply_current();
+    return Status_OK;
+}
+
+static uint32_t rts1_get_current (setting_id_t setting)
+{
+    uint_fast8_t idx;
+    settings_get_axis_base(setting, &idx);
+    return idx < N_AXIS ? rts1_current.run_ma[idx] : 0;
+}
+
+static const setting_detail_t rts1_current_setting[] = {
+    { Setting_AxisStepperCurrent, Group_Axis0, "-axis motor current", "mA", Format_Integer, "####0", "0", "2800", Setting_NonCoreFn, rts1_set_current, rts1_get_current, NULL, { .subgroups = On, .increment = 1 } }
+};
+
+static const setting_descr_t rts1_current_descr[] = {
+    { Setting_AxisStepperCurrent, "Stepper motor run current (approx. mA; DRV8452 TRQ_DAC, ~2.8 A full scale, uncalibrated - tune by motor temperature). Lower for a smaller motor, e.g. a NEMA 17 on the A axis." }
+};
+
+static void rts1_current_save (void)
+{
+    hal.nvs.memcpy_to_nvs(rts1_current_nvs, (uint8_t *)&rts1_current, sizeof(rts1_current), true);
+}
+
+static void rts1_current_restore (void)
+{
+    for(uint8_t i = 0; i < N_AXIS; i++)
+        rts1_current.run_ma[i] = RTS1_DEFAULT_CURRENT_MA;
+    rts1_current_save();
+}
+
+static void rts1_current_load (void)
+{
+    if(hal.nvs.memcpy_from_nvs((uint8_t *)&rts1_current, rts1_current_nvs, sizeof(rts1_current), true) != NVS_TransferResult_OK)
+        rts1_current_restore();
+    rts1_apply_current();                                    // push loaded values to the drivers
+}
+
+static setting_details_t rts1_current_details = {
+    .settings = rts1_current_setting,
+    .n_settings = sizeof(rts1_current_setting) / sizeof(setting_detail_t),
+    .descriptions = rts1_current_descr,
+    .n_descriptions = sizeof(rts1_current_descr) / sizeof(setting_descr_t),
+    .save = rts1_current_save,
+    .load = rts1_current_load,
+    .restore = rts1_current_restore
+};
+
+// Register from the weak my_plugin_init() hook - the canonical grblHAL plugin-init
+// point (called alongside vfd_init in plugins_init.h), so our nvs_alloc lands in the
+// driver settings area correctly (allocating from board_init aliased the core NVS
+// region). settings_init() runs after this and calls our load().
+void my_plugin_init (void)
+{
+    if((rts1_current_nvs = nvs_alloc(sizeof(rts1_current_settings_t))))
+        settings_register(&rts1_current_details);
+}
+
 void board_init (void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -880,6 +982,8 @@ void board_init (void)
     rts1_busywait(7200000);
 
     // Bring the five DRV8452 drivers out of Hi-Z and set their current (SPI).
+    // Per-axis current ($140-$143) is registered in my_plugin_init() and applied by
+    // its load() at settings_init; drv_configure uses the defaults until then.
     rts1_drv8452_init();
 
     // Monitor motor power (VM): e-stop on loss, recover drivers on reset.
