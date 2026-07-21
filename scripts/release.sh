@@ -90,7 +90,10 @@ Rules:
 
 Output ONLY the markdown. No preamble. No explanation. Just the markdown."
 
-RELEASE_NOTES=$(claude -p --system-prompt "You are a release-note generator for grblHAL firmware that runs on the Onefinity RTS-1 CNC controller. Write for machine owners (end users) in plain, non-technical language - describe only what the controller now does or what was fixed for them on their machine. Skip everything internal or behind-the-scenes: refactors, tests, CI, build/release tooling, documentation/README, licensing, and reverse-engineering notes. Never mention pins, chips, registers, or file names. Only use the commit messages provided; never invent changes." "$PROMPT" 2>&1)
+# NOTE: capture stdout only (no 2>&1). The claude CLI prints warnings/notices (e.g.
+# "claude.ai connectors are disabled ...") to stderr; merging them in pollutes the
+# release notes. Let stderr flow to the terminal instead.
+RELEASE_NOTES=$(claude -p --system-prompt "You are a release-note generator for grblHAL firmware that runs on the Onefinity RTS-1 CNC controller. Write for machine owners (end users) in plain, non-technical language - describe only what the controller now does or what was fixed for them on their machine. Skip everything internal or behind-the-scenes: refactors, tests, CI, build/release tooling, documentation/README, licensing, and reverse-engineering notes. Never mention pins, chips, registers, or file names. Only use the commit messages provided; never invent changes." "$PROMPT")
 CLAUDE_EXIT_CODE=$?
 
 if [ $CLAUDE_EXIT_CODE -ne 0 ] || [ -z "$RELEASE_NOTES" ]; then
@@ -123,6 +126,11 @@ if [ $CLAUDE_EXIT_CODE -ne 0 ] || [ -z "$RELEASE_NOTES" ]; then
         done <<< "$OTHER"
     fi
 else
+    # Belt-and-suspenders: keep only from the first "## What's Changed" heading onward,
+    # dropping any preamble/notice the CLI might emit before the notes proper.
+    if printf '%s\n' "$RELEASE_NOTES" | grep -q "^## What's Changed"; then
+        RELEASE_NOTES=$(printf '%s\n' "$RELEASE_NOTES" | sed -n "/^## What's Changed/,\$p")
+    fi
     echo "Release notes generated successfully"
 fi
 
