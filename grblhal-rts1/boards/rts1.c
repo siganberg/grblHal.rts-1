@@ -374,12 +374,30 @@ static probe_state_t rts1_probe_get_state (void)
     return s;
 }
 
+// hal.probe.is_triggered - separate from get_state, and what the NGC reserved params
+// #<_probe_state> / #<_toolsetter_state> read (used by e.g. the RapidChange ATC macros).
+// We must hook it too, or those params fall through to the driver's GPIO default (which
+// has no idea about our expander probe -> reads a phantom, e.g. always 1). Reads the
+// probe (bit 8) and tool-setter (bit 9) SEPARATELY here (unlike the OR-tie in get_state,
+// which is only for the G38 probe move).
+static bool rts1_probe_is_triggered (probe_id_t probe_id)
+{
+    uint16_t bit = probe_id == Probe_Toolsetter ? (1u << RTS1_TLS_BIT) : (1u << RTS1_PROBE_BIT);
+    bool triggered = !(rts1_iso & bit);                       // active-low: 0 = contact
+    if(probe_id != Probe_Toolsetter && settings.probe.invert_probe_pin)
+        triggered = !triggered;                               // $6
+    return triggered;
+}
+
 static void rts1_probe_init (void)
 {
     if(hal.probe.get_state) {                         // probe HAL present (PROBE_ENABLE + aux claim)
         rts1_next_probe_configure = hal.probe.configure;
         hal.probe.configure = rts1_probe_configure;
         hal.probe.get_state = rts1_probe_get_state;
+        hal.probe.is_triggered = rts1_probe_is_triggered;   // fixes #<_probe_state> NGC param
+        // NOTE: hal.driver_cap.toolsetter left off for now, so #<_toolsetter_state>
+        // reports -1 (not available) - revisit to expose the expander tool-setter (bit 9).
     }
 }
 
