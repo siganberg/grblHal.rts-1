@@ -282,6 +282,33 @@ static bool rts1_tca_write (uint8_t reg, uint8_t val)
     return i2c_transfer(&t, false);          // write (blocking)
 }
 
+// EEPROM recovery. Blanks the settings EEPROM so grblHAL restores clean defaults -
+// the fix if a bad build corrupts the NVS and boot hangs reading it (DFU can't touch
+// the external EEPROM; only firmware can). 24C32: 4 KB, 2-byte address, 32-byte pages,
+// on the same I2C bus as the TCA9555. Reachable two ways:
+//   - build with -D RTS1_WIPE_EEPROM=1 -> wipes once at board_init (use when boot hangs;
+//     flash via BOOT0/DFU, boot, then flash a normal build)
+//   - runtime "$EEWIPE" command (use when it still boots) then power-cycle.
+#ifndef RTS1_WIPE_EEPROM
+#define RTS1_WIPE_EEPROM 0
+#endif
+static void rts1_eeprom_wipe (void)
+{
+    static uint8_t ff[32];
+    for(uint8_t i = 0; i < sizeof(ff); i++) ff[i] = 0xFF;
+    i2c_start();
+    for(uint16_t addr = 0; addr < 4096; addr += sizeof(ff)) {
+        i2c_transfer_t t = {0};
+        t.address         = 0x50;               // EEPROM I2C address
+        t.word_addr       = addr;
+        t.word_addr_bytes = 2;                  // 16-bit memory address
+        t.count           = sizeof(ff);
+        t.data            = ff;
+        i2c_transfer(&t, false);                // write one page (blocking)
+        rts1_busywait(500000);                  // ~5 ms EEPROM write cycle
+    }
+}
+
 static void rts1_tca_init (void)
 {
     i2c_start();    // init I2C1 (PB6/PB7); idempotent if the EEPROM/NVS layer already did
@@ -558,6 +585,11 @@ static status_code_t rts1_sys_command (sys_state_t state, char *line)
         rts1_puthex12(b, &p, th);
         b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
         rts1_emit(b);
+        return Status_OK;
+    }
+    if(!strcmp(line, "EEWIPE")) {                    // "$EEWIPE": blank the settings EEPROM
+        rts1_eeprom_wipe();                          // recover from a corrupt NVS while still booting
+        rts1_emit("[MSG:EEPROM wiped - power-cycle to load defaults]" ASCII_EOL);
         return Status_OK;
     }
     return rts1_on_sys_command ? rts1_on_sys_command(state, line) : Status_Unhandled;
@@ -985,6 +1017,11 @@ void my_plugin_init (void)
         settings_register(&rts1_current_details);
 }
 
+// WARNING: do NOT call nvs_alloc()/settings_register() from here. board_init() runs
+// before grblHAL finalizes the NVS buffer, so nvs_alloc() returns a bad address and a
+// later save() writes over another settings region, corrupting the EEPROM (persistent -
+// hangs every subsequent boot; recover with $EEWIPE or an RTS1_WIPE_EEPROM build).
+// Register persistent settings from my_plugin_init() instead (see above).
 void board_init (void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
@@ -1010,6 +1047,10 @@ void board_init (void)
     // the MCU; configuring too early misses EN_OUT. ~80 ms biases the first attempt to
     // succeed; rts1_realtime self-heals if the rail is even slower (no reboot needed).
     rts1_busywait(7200000);
+
+#if RTS1_WIPE_EEPROM
+    rts1_eeprom_wipe();     // recovery: blank the settings EEPROM before grblHAL reads it
+#endif
 
     // Bring the five DRV8452 drivers out of Hi-Z and set their current (SPI).
     // Per-axis current ($140-$143) is registered in my_plugin_init() and applied by
