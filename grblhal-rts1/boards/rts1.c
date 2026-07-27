@@ -464,6 +464,16 @@ static xbar_t *rts1_aux_get_pin_info (io_port_direction_t dir, uint8_t port)
     return NULL;
 }
 
+// REQUIRED by ioports: _ioports_add() calls set_description() for every port during
+// registration, and that veneer blindly invokes this handler. Omitting it leaves the
+// veneer target NULL -> a NULL call that hard-faults the boot (USB is already up, so the
+// board enumerates but never reaches the main loop). Store the description like pca9654e.
+static void rts1_aux_set_pin_description (io_port_direction_t dir, uint8_t port, const char *description)
+{
+    if(dir == Port_Output && port < RTS1_N_AUX_OUT)
+        rts1_aux_out[port].description = description;
+}
+
 static void rts1_aux_out_init (void)
 {
     rts1_aux_data.out.n_ports = RTS1_N_AUX_OUT;
@@ -478,9 +488,10 @@ static void rts1_aux_out_init (void)
         rts1_aux_out[i].mode.output   = On;
     }
     io_digital_t dports = {
-        .ports        = &rts1_aux_data,
-        .digital_out  = rts1_aux_digital_out,
-        .get_pin_info = rts1_aux_get_pin_info,
+        .ports              = &rts1_aux_data,
+        .digital_out        = rts1_aux_digital_out,
+        .get_pin_info       = rts1_aux_get_pin_info,
+        .set_pin_description = rts1_aux_set_pin_description,
     };
     ioports_add_digital(&dports);
 }
