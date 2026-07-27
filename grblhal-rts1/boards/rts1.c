@@ -28,6 +28,7 @@
 
 #include "driver.h"
 #include "grbl/nvs_buffer.h"
+#include "grbl/ioports.h"
 
 #if defined(BOARD_RTS1)
 
@@ -282,6 +283,12 @@ static bool rts1_tca_write (uint8_t reg, uint8_t val)
     return i2c_transfer(&t, false);          // write (blocking)
 }
 
+// Cached port-1 output byte (bits 8..15): bit7 (0x80) = status LED (overall bit 15);
+// bits3..6 (0x08/0x10/0x20/0x40) = the 4 relay outputs OUT0..OUT3 (overall bits 11..14).
+// One byte so the LED and the aux relays don't clobber each other's bits on write.
+static volatile uint8_t rts1_out1 = RTS1_LED_BYTE;   // LED on, relays off at boot
+static void rts1_out1_apply (void) { rts1_tca_write(RTS1_TCA_OUTPUT1, rts1_out1); }
+
 // EEPROM recovery. Blanks the settings EEPROM so grblHAL restores clean defaults -
 // the fix if a bad build corrupts the NVS and boot hangs reading it (DFU can't touch
 // the external EEPROM; only firmware can). 24C32: 4 KB, 2-byte address, 32-byte pages,
@@ -312,9 +319,10 @@ static void rts1_eeprom_wipe (void)
 static void rts1_tca_init (void)
 {
     i2c_start();    // init I2C1 (PB6/PB7); idempotent if the EEPROM/NVS layer already did
-    // Make ONLY port-1 bit 7 (status LED) an output; everything else stays input.
-    rts1_tca_write(RTS1_TCA_CONFIG1, 0x7F);          // bit7=0 output, bits0..6=1 input
-    rts1_tca_write(RTS1_TCA_OUTPUT1, RTS1_LED_BYTE); // LED on at boot (matches stock)
+    // Port-1 bits 3..7 = outputs (relays OUT0..OUT3 on bits 11..14 + LED on bit 15),
+    // bits 0..2 (probe bit8, tool-setter bit9, spare bit10) stay inputs. Matches stock.
+    rts1_tca_write(RTS1_TCA_CONFIG1, 0x07);          // bits3..7=0 output, bits0..2=1 input
+    rts1_out1_apply();                               // LED on, relays off at boot
 }
 
 // Read the expander's 16 input bits (port0 = low byte, port1 = high byte).
@@ -399,6 +407,82 @@ static void rts1_probe_init (void)
         // NOTE: hal.driver_cap.toolsetter left off for now, so #<_toolsetter_state>
         // reports -1 (not available) - revisit to expose the expander tool-setter (bit 9).
     }
+}
+
+// ===================== Aux digital outputs (DB-25 OUT0-OUT3) =====================
+// The 4 CPC1017N relays (TCA9555 bits 11..14 = port-1 bits 3..6) exposed to grblHAL as
+// aux digital outputs -> M64 P0..P3 / M65 P0..P3. Each is a dry-contact pair on the
+// DB-25 (OUT0=9/10, OUT1=11/12, OUT2=19/20, OUT3=17/18).
+// NOTE: the port->bit order below is a BEST GUESS - verify on the bench (M64 P0..P3,
+// watch which relay clicks) and adjust rts1_aux_bit. Coolant Flood/Mist defaults on
+// OUT0/OUT1 are a follow-up once the mapping is confirmed.
+#define RTS1_N_AUX_OUT 4
+static const uint8_t rts1_aux_bit[RTS1_N_AUX_OUT] = { 3, 4, 5, 6 };  // port-1 bits (= overall 11..14)
+static io_ports_data_t rts1_aux_data = {0};
+static xbar_t rts1_aux_out[RTS1_N_AUX_OUT] = {0};
+
+static void rts1_aux_ll (xbar_t *output, float value)
+{
+    uint8_t mask = 1u << rts1_aux_bit[output->id];
+    bool on = value != 0.0f;
+    if(rts1_aux_out[output->id].mode.inverted)
+        on = !on;
+    if(on) rts1_out1 |= mask; else rts1_out1 &= (uint8_t)~mask;
+    rts1_out1_apply();
+}
+
+static void rts1_aux_digital_out (uint8_t port, bool on)
+{
+    if(port < RTS1_N_AUX_OUT)
+        rts1_aux_ll(&rts1_aux_out[port], on ? 1.0f : 0.0f);
+}
+
+static float rts1_aux_get_state (xbar_t *output)
+{
+    return output->id < RTS1_N_AUX_OUT
+            ? (float)((rts1_out1 & (1u << rts1_aux_bit[output->id])) != 0)
+            : -1.0f;
+}
+
+static bool rts1_aux_set_function (xbar_t *output, pin_function_t function)
+{
+    if(output->id < RTS1_N_AUX_OUT)
+        rts1_aux_out[output->id].function = function;
+    return output->id < RTS1_N_AUX_OUT;
+}
+
+static xbar_t *rts1_aux_get_pin_info (io_port_direction_t dir, uint8_t port)
+{
+    static xbar_t pin;
+    if(dir == Port_Output && port < RTS1_N_AUX_OUT) {
+        memcpy(&pin, &rts1_aux_out[port], sizeof(xbar_t));
+        pin.get_value    = rts1_aux_get_state;
+        pin.set_value    = rts1_aux_ll;
+        pin.set_function = rts1_aux_set_function;
+        return &pin;
+    }
+    return NULL;
+}
+
+static void rts1_aux_out_init (void)
+{
+    rts1_aux_data.out.n_ports = RTS1_N_AUX_OUT;
+    for(uint8_t i = 0; i < RTS1_N_AUX_OUT; i++) {
+        rts1_aux_out[i].id            = i;
+        rts1_aux_out[i].pin           = i;
+        rts1_aux_out[i].function      = Output_Aux0 + i;
+        rts1_aux_out[i].group         = PinGroup_AuxOutput;
+        rts1_aux_out[i].cap.output    = On;
+        rts1_aux_out[i].cap.external  = On;
+        rts1_aux_out[i].cap.claimable = On;
+        rts1_aux_out[i].mode.output   = On;
+    }
+    io_digital_t dports = {
+        .ports        = &rts1_aux_data,
+        .digital_out  = rts1_aux_digital_out,
+        .get_pin_info = rts1_aux_get_pin_info,
+    };
+    ioports_add_digital(&dports);
 }
 
 // ===================== Parking defaults (baked at runtime) =====================
@@ -715,7 +799,8 @@ static void rts1_realtime (sys_state_t state)
             led = true;                                  // solid: idle / ready
         if(led != rts1_led_on) {                         // write only on change (tiny I2C load)
             rts1_led_on = led;
-            rts1_tca_write(RTS1_TCA_OUTPUT1, led ? RTS1_LED_BYTE : 0x00);
+            if(led) rts1_out1 |= RTS1_LED_BYTE; else rts1_out1 &= (uint8_t)~RTS1_LED_BYTE;
+            rts1_out1_apply();                           // preserves the relay bits
         }
     }
 
@@ -1085,6 +1170,7 @@ void board_init (void)
     // 8 inputs, 4 outputs). Init the bus, then route the probe bit into grblHAL.
     rts1_tca_init();
     rts1_probe_init();
+    rts1_aux_out_init();    // register OUT0..OUT3 relays as aux outputs (M64/M65 P0..P3)
 
     // Bake parking defaults ($41=1, $57=500, $59=3000) at runtime - see rts1_parking_init.
     rts1_parking_init();
