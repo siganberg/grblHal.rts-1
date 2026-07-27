@@ -1118,6 +1118,8 @@ void my_plugin_init (void)
 {
     if((rts1_current_nvs = nvs_alloc(sizeof(rts1_current_settings_t))))
         settings_register(&rts1_current_details);
+
+    rts1_aux_out_init();    // register OUT0..OUT3 as aux outputs here (correct NVS phase)
 }
 
 // WARNING: do NOT call nvs_alloc()/settings_register() from here. board_init() runs
@@ -1168,9 +1170,10 @@ void board_init (void)
 
     // TCA9555 I2C expander: gateway to all isolated DB-25 I/O (probe, tool-setter,
     // 8 inputs, 4 outputs). Init the bus, then route the probe bit into grblHAL.
-    rts1_tca_init();
+    rts1_tca_init();        // configures the relay output pins (bits 11..14)
     rts1_probe_init();
-    rts1_aux_out_init();    // register OUT0..OUT3 relays as aux outputs (M64/M65 P0..P3)
+    // NOTE: rts1_aux_out_init() (ioports_add_digital) is called from my_plugin_init(),
+    // NOT here - registering settings from board_init corrupts the NVS (see warning above).
 
     // Bake parking defaults ($41=1, $57=500, $59=3000) at runtime - see rts1_parking_init.
     rts1_parking_init();
