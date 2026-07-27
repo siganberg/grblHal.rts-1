@@ -404,8 +404,11 @@ static void rts1_probe_init (void)
         hal.probe.configure = rts1_probe_configure;
         hal.probe.get_state = rts1_probe_get_state;
         hal.probe.is_triggered = rts1_probe_is_triggered;   // fixes #<_probe_state> NGC param
-        // NOTE: hal.driver_cap.toolsetter left off for now, so #<_toolsetter_state>
-        // reports -1 (not available) - revisit to expose the expander tool-setter (bit 9).
+        // Advertise the expander tool-setter (bit 9) so #<_toolsetter_state> reports the real
+        // 0/1 state instead of -1 ("not available"). Without this, ATC macros that gate on
+        // [#<_toolsetter_state> EQ 0] never see 0 and skip their failed-load check. The bit is
+        // read (separately from the probe) in rts1_probe_is_triggered(Probe_Toolsetter).
+        hal.driver_cap.toolsetter = On;
     }
 }
 
