@@ -41,26 +41,32 @@ _Min_Stack_Size = 0x400; /* required amount of stack */
 
 /* Memories definition */
 /* NVS lives in the external I2C EEPROM (EEPROM_ENABLE -> FLASH_ENABLE=0), so the old
-   16 KB flash-NVS emulation sector (was EEPROM_EMUL @ 0x8004000) is reclaimed for code:
-   FLASH now spans sectors 1-5 = 240 KB. The _EEPROM_Emul_* symbols are gone (only the
-   FLASH_ENABLE=0 build referenced them, via Src/flash.c, which is no longer compiled). */
+   16 KB flash-NVS emulation sector (was EEPROM_EMUL @ 0x8004000) is reclaimed for code.
+   The _EEPROM_Emul_* symbols are gone (only the FLASH_ENABLE=0 build referenced them, via
+   Src/flash.c, which is no longer compiled).
+   Single FLASH region spanning the whole 256 KB (sectors 0-5) from 0x8000000 - the standard
+   STM32F4 layout used by the other grblHAL ldscripts. There is no flash bootloader ($DFU
+   jumps to the STM32 ROM system bootloader), so the vector table sits at the very start of
+   FLASH and the previously-wasted sector 0 (~15.5 KB) is now available for code. */
 MEMORY
 {
   RAM    (xrw)    : ORIGIN = 0x20000000,   LENGTH = 64K
-  BOOT_FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 16K
-  FLASH    (rx)    : ORIGIN = 0x8004000,   LENGTH = 256K - 16K
+  FLASH    (rx)    : ORIGIN = 0x8000000,   LENGTH = 256K
 }
+
+/* VTOR base (main.c/driver.c set SCB->VTOR to this). Matches the other grblHAL ldscripts. */
+_FLASH_VectorTable = ORIGIN(FLASH);
 
 /* Sections */
 SECTIONS
 {
-  /* The startup code into "FLASH" Rom type memory */
+  /* Vector table at the very start of FLASH (0x8000000) - where the CPU boots from. */
   .isr_vector :
   {
     . = ALIGN(4);
     KEEP(*(.isr_vector)) /* Startup code */
     . = ALIGN(4);
-  } >BOOT_FLASH
+  } >FLASH
 
   /* The program code and other data into "FLASH" Rom type memory */
   .text :
