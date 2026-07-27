@@ -411,13 +411,16 @@ static void rts1_probe_init (void)
 
 // ===================== Aux digital outputs (DB-25 OUT0-OUT3) =====================
 // The 4 CPC1017N relays (TCA9555 bits 11..14 = port-1 bits 3..6) exposed to grblHAL as
-// aux digital outputs -> M64 P0..P3 / M65 P0..P3. Each is a dry-contact pair on the
-// DB-25 (OUT0=9/10, OUT1=11/12, OUT2=19/20, OUT3=17/18).
-// NOTE: the port->bit order below is a BEST GUESS - verify on the bench (M64 P0..P3,
-// watch which relay clicks) and adjust rts1_aux_bit. Coolant Flood/Mist defaults on
-// OUT0/OUT1 are a follow-up once the mapping is confirmed.
+// aux digital outputs. The driver already owns aux out 0 (PA0), so ours are appended as
+// grblHAL ports P1..P4 -> control with M64 P1..P4 / M65 P1..P4. Each is a dry-contact
+// pair on the DB-25 (OUT0=9/10, OUT1=11/12, OUT2=19/20, OUT3=17/18).
+// Bench-confirmed physical bit order (multimeter continuity test, 2026-07):
+//   port-1 bit 3 (overall 11) = OUT3    port-1 bit 5 (overall 13) = OUT1
+//   port-1 bit 4 (overall 12) = OUT0    port-1 bit 6 (overall 14) = OUT2
+// So to get the natural P1->OUT0, P2->OUT1, P3->OUT2, P4->OUT3, index our ports (id 0..3
+// = P1..P4) to bits {4,5,6,3}. Coolant Flood/Mist defaults on OUT0/OUT1 are a follow-up.
 #define RTS1_N_AUX_OUT 4
-static const uint8_t rts1_aux_bit[RTS1_N_AUX_OUT] = { 3, 4, 5, 6 };  // port-1 bits (= overall 11..14)
+static const uint8_t rts1_aux_bit[RTS1_N_AUX_OUT] = { 4, 5, 6, 3 };  // id0..3 (P1..P4) -> OUT0..OUT3
 static io_ports_data_t rts1_aux_data = {0};
 static xbar_t rts1_aux_out[RTS1_N_AUX_OUT] = {0};
 
@@ -474,13 +477,27 @@ static void rts1_aux_set_pin_description (io_port_direction_t dir, uint8_t port,
         rts1_aux_out[port].description = description;
 }
 
+// Find the next free aux-output function number (walk already-registered aux outputs and
+// take max+1). The driver registers its own aux out (PA0 = Output_Aux0) BEFORE us, so our
+// ports must continue the sequence (Output_Aux1..) - hardcoding Output_Aux0 collides with
+// the driver's port and corrupts the core's function->port index mapping (breaks port
+// counting, claiming and the event-out plugin). Mirrors plugins/pca9654e.c.
+static void rts1_get_aux_max (xbar_t *pin, void *fn)
+{
+    if(pin->group == PinGroup_AuxOutput)
+        *(pin_function_t *)fn = max(*(pin_function_t *)fn, pin->function + 1);
+}
+
 static void rts1_aux_out_init (void)
 {
+    pin_function_t aux_out_base = Output_Aux0;
+    hal.enumerate_pins(false, rts1_get_aux_max, &aux_out_base);   // -> first free aux fn (after driver's PA0)
+
     rts1_aux_data.out.n_ports = RTS1_N_AUX_OUT;
     for(uint8_t i = 0; i < RTS1_N_AUX_OUT; i++) {
         rts1_aux_out[i].id            = i;
         rts1_aux_out[i].pin           = i;
-        rts1_aux_out[i].function      = Output_Aux0 + i;
+        rts1_aux_out[i].function      = aux_out_base + i;
         rts1_aux_out[i].group         = PinGroup_AuxOutput;
         rts1_aux_out[i].cap.output    = On;
         rts1_aux_out[i].cap.external  = On;
@@ -494,6 +511,43 @@ static void rts1_aux_out_init (void)
         .set_pin_description = rts1_aux_set_pin_description,
     };
     ioports_add_digital(&dports);
+}
+
+// ===================== Coolant on aux outputs (Flood=OUT0, Mist=OUT1) =====================
+// The RTS-1 has no dedicated coolant pins, so bind M8 (flood) -> OUT0 and M7 (mist) -> OUT1
+// on the DB-25 relays directly. This makes the Flood/Mist buttons + M7/M8 work out of the
+// box, deterministically. The two relays stay usable as manual aux outputs (M64/M65 P1/P2)
+// too - both paths just toggle the same relay bit (last writer wins).
+#define RTS1_FLOOD_AUX 0    // OUT0 = our aux id 0 = grblHAL port P1
+#define RTS1_MIST_AUX  1    // OUT1 = our aux id 1 = grblHAL port P2
+
+static coolant_set_state_ptr rts1_next_coolant_set_state;
+
+static void rts1_coolant_set_state (coolant_state_t state)
+{
+    rts1_aux_ll(&rts1_aux_out[RTS1_FLOOD_AUX], state.flood ? 1.0f : 0.0f);
+    rts1_aux_ll(&rts1_aux_out[RTS1_MIST_AUX],  state.mist  ? 1.0f : 0.0f);
+    if(rts1_next_coolant_set_state)
+        rts1_next_coolant_set_state(state);   // chain (drives dedicated pins if any - none here)
+}
+
+static coolant_state_t rts1_coolant_get_state (void)
+{
+    coolant_state_t state = {0};
+    state.flood = (rts1_out1 & (1u << rts1_aux_bit[RTS1_FLOOD_AUX])) != 0;
+    state.mist  = (rts1_out1 & (1u << rts1_aux_bit[RTS1_MIST_AUX]))  != 0;
+    return state;
+}
+
+// Hook coolant onto the aux relays. Call from my_plugin_init() after rts1_aux_out_init(),
+// i.e. after the driver has installed hal.coolant.set_state and our ports exist.
+static void rts1_coolant_init (void)
+{
+    rts1_next_coolant_set_state = hal.coolant.set_state;
+    hal.coolant.set_state = rts1_coolant_set_state;
+    hal.coolant.get_state = rts1_coolant_get_state;
+    hal.coolant_cap.flood = On;                 // ensure M8/M7 are accepted by the parser
+    hal.coolant_cap.mist  = On;
 }
 
 // ===================== Parking defaults (baked at runtime) =====================
@@ -1131,6 +1185,7 @@ void my_plugin_init (void)
         settings_register(&rts1_current_details);
 
     rts1_aux_out_init();    // register OUT0..OUT3 as aux outputs here (correct NVS phase)
+    rts1_coolant_init();    // bind M8->OUT0 (flood), M7->OUT1 (mist)
 }
 
 // WARNING: do NOT call nvs_alloc()/settings_register() from here. board_init() runs
