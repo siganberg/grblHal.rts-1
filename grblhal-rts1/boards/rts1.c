@@ -423,18 +423,50 @@ static void rts1_probe_init (void)
 // So to get the natural P1->OUT0, P2->OUT1, P3->OUT2, P4->OUT3, index our ports (id 0..3
 // = P1..P4) to bits {4,5,6,3}. Coolant Flood/Mist defaults on OUT0/OUT1 are a follow-up.
 #define RTS1_N_AUX_OUT 4
+#define RTS1_FLOOD_AUX 0    // OUT0 = aux id 0 = grblHAL port P1 = coolant flood (M8)
+#define RTS1_MIST_AUX  1    // OUT1 = aux id 1 = grblHAL port P2 = coolant mist  (M7)
 static const uint8_t rts1_aux_bit[RTS1_N_AUX_OUT] = { 4, 5, 6, 3 };  // id0..3 (P1..P4) -> OUT0..OUT3
 static io_ports_data_t rts1_aux_data = {0};
 static xbar_t rts1_aux_out[RTS1_N_AUX_OUT] = {0};
 
+// Logical on/off requested per aux id (bit i) - what M64/M65 / coolant last asked for. The
+// PHYSICAL relay level is logical XOR the $372 invert bit; rts1_out1 holds only the physical
+// bits, so we track logical here.
+static uint8_t rts1_aux_log = 0;
+
+// $372 "Invert I/O Port outputs" for this port, read straight from the setting mask. Bit
+// position = global aux-output port index = n_start + local id. We read the mask directly
+// rather than via the core's per-port config callback: that callback never reaches our
+// expander ports (get_pin_info returns NULL for them in ioports_configure), so mode.inverted
+// would stay 0. The mask itself IS stored correctly ($AUXDBG confirmed mask + n_start).
+static bool rts1_aux_inverted (uint8_t id)
+{
+    bool inv = (settings.ioport.invert_out.mask >> (rts1_aux_data.out.n_start + id)) & 1;   // $372 aux invert
+    // OUT0/OUT1 are the coolant relays, so ALSO honor $15 "Invert coolant outputs" (the
+    // intuitive Flood/Mist setting). OR-combined with $372 so either inverts and both never
+    // double-invert. ($15's dedicated-pin path in the driver drives nothing on this board.)
+    if(id == RTS1_FLOOD_AUX) inv = inv || settings.coolant.invert.flood;
+    if(id == RTS1_MIST_AUX)  inv = inv || settings.coolant.invert.mist;
+    return inv;
+}
+
+// Drive the physical relay for one aux id: physical = logical XOR invert.
+static void rts1_aux_apply (uint8_t id)
+{
+    uint8_t mask = 1u << rts1_aux_bit[id];
+    if((((rts1_aux_log >> id) & 1) ^ rts1_aux_inverted(id)))
+        rts1_out1 |= mask;
+    else
+        rts1_out1 &= (uint8_t)~mask;
+    rts1_out1_apply();
+}
+
 static void rts1_aux_ll (xbar_t *output, float value)
 {
-    uint8_t mask = 1u << rts1_aux_bit[output->id];
-    bool on = value != 0.0f;
-    if(rts1_aux_out[output->id].mode.inverted)
-        on = !on;
-    if(on) rts1_out1 |= mask; else rts1_out1 &= (uint8_t)~mask;
-    rts1_out1_apply();
+    uint8_t id = output->id;
+    if(value != 0.0f) rts1_aux_log |= (uint8_t)(1u << id);
+    else              rts1_aux_log &= (uint8_t)~(1u << id);
+    rts1_aux_apply(id);
 }
 
 static void rts1_aux_digital_out (uint8_t port, bool on)
@@ -443,11 +475,15 @@ static void rts1_aux_digital_out (uint8_t port, bool on)
         rts1_aux_ll(&rts1_aux_out[port], on ? 1.0f : 0.0f);
 }
 
+// Logical (un-inverted) state: what M64/M65/coolant last asked for, regardless of $372.
+static bool rts1_aux_logical (uint8_t id)
+{
+    return (rts1_aux_log >> id) & 1;
+}
+
 static float rts1_aux_get_state (xbar_t *output)
 {
-    return output->id < RTS1_N_AUX_OUT
-            ? (float)((rts1_out1 & (1u << rts1_aux_bit[output->id])) != 0)
-            : -1.0f;
+    return output->id < RTS1_N_AUX_OUT ? (float)rts1_aux_logical(output->id) : -1.0f;
 }
 
 static bool rts1_aux_set_function (xbar_t *output, pin_function_t function)
@@ -455,6 +491,28 @@ static bool rts1_aux_set_function (xbar_t *output, pin_function_t function)
     if(output->id < RTS1_N_AUX_OUT)
         rts1_aux_out[output->id].function = function;
     return output->id < RTS1_N_AUX_OUT;
+}
+
+// A config handler must exist or the core drops our ports from the $372 setting. The invert
+// itself is applied from the mask in rts1_aux_apply()/rts1_on_settings_changed(); here we
+// just re-drive, in case the core ever does call this.
+static bool rts1_aux_out_cfg (xbar_t *output, gpio_out_config_t *config, bool persistent)
+{
+    (void)config; (void)persistent;
+    if(output->id < RTS1_N_AUX_OUT)
+        rts1_aux_apply(output->id);
+    return output->id < RTS1_N_AUX_OUT;
+}
+
+// Re-drive every aux relay from the current $372 mask. Called from rts1_on_settings_changed
+// (the shared settings hook) so the invert takes effect on the idle/current state on any
+// $-change AND at boot - the core never calls our per-port config for the expander ports.
+static void rts1_aux_apply_all (void)
+{
+    if(rts1_aux_data.out.n_ports == 0)      // ports not registered yet (early settings-changed)
+        return;
+    for(uint8_t i = 0; i < RTS1_N_AUX_OUT; i++)
+        rts1_aux_apply(i);
 }
 
 static xbar_t *rts1_aux_get_pin_info (io_port_direction_t dir, uint8_t port)
@@ -465,6 +523,7 @@ static xbar_t *rts1_aux_get_pin_info (io_port_direction_t dir, uint8_t port)
         pin.get_value    = rts1_aux_get_state;
         pin.set_value    = rts1_aux_ll;
         pin.set_function = rts1_aux_set_function;
+        pin.config       = rts1_aux_out_cfg;       // enables $372 invert for this port
         return &pin;
     }
     return NULL;
@@ -514,16 +573,15 @@ static void rts1_aux_out_init (void)
         .set_pin_description = rts1_aux_set_pin_description,
     };
     ioports_add_digital(&dports);
+    rts1_aux_apply_all();     // apply any saved $372 invert to the idle relay state at boot
 }
 
 // ===================== Coolant on aux outputs (Flood=OUT0, Mist=OUT1) =====================
 // The RTS-1 has no dedicated coolant pins, so bind M8 (flood) -> OUT0 and M7 (mist) -> OUT1
 // on the DB-25 relays directly. This makes the Flood/Mist buttons + M7/M8 work out of the
 // box, deterministically. The two relays stay usable as manual aux outputs (M64/M65 P1/P2)
-// too - both paths just toggle the same relay bit (last writer wins).
-#define RTS1_FLOOD_AUX 0    // OUT0 = our aux id 0 = grblHAL port P1
-#define RTS1_MIST_AUX  1    // OUT1 = our aux id 1 = grblHAL port P2
-
+// too - both paths just toggle the same relay bit (last writer wins). RTS1_FLOOD_AUX /
+// RTS1_MIST_AUX (= aux id 0/1) are defined up in the aux-output section.
 static coolant_set_state_ptr rts1_next_coolant_set_state;
 
 static void rts1_coolant_set_state (coolant_state_t state)
@@ -537,8 +595,8 @@ static void rts1_coolant_set_state (coolant_state_t state)
 static coolant_state_t rts1_coolant_get_state (void)
 {
     coolant_state_t state = {0};
-    state.flood = (rts1_out1 & (1u << rts1_aux_bit[RTS1_FLOOD_AUX])) != 0;
-    state.mist  = (rts1_out1 & (1u << rts1_aux_bit[RTS1_MIST_AUX]))  != 0;
+    state.flood = rts1_aux_logical(RTS1_FLOOD_AUX);   // logical, so $372 invert stays correct
+    state.mist  = rts1_aux_logical(RTS1_MIST_AUX);
     return state;
 }
 
@@ -575,6 +633,7 @@ static void rts1_apply_parking (settings_t *s)
 static void rts1_on_settings_changed (settings_t *settings, settings_changed_flags_t changed)
 {
     rts1_apply_parking(settings);                   // re-bake after $RST=$ / setting changes
+    rts1_aux_apply_all();                           // apply $372 invert to the relays (mask already updated)
     if(rts1_next_settings_changed)
         rts1_next_settings_changed(settings, changed);
 }
