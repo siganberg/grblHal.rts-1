@@ -87,6 +87,20 @@ independently** and bypass the planner buffer — this is what most senders' Flo
 Mist toggle switches use, so turning one off leaves the other untouched. OUT0/OUT1
 also remain usable as manual `M64/M65 P1/P2` outputs (last write wins).
 
+### Inverting outputs
+Each relay's polarity can be flipped so its *idle* state is closed instead of open
+(useful for normally-closed valves/contactors). An inverted output reads **closed at
+idle** and **opens when switched on** — and the inversion applies to *both* the coolant
+(`M7`/`M8`) and manual (`M64`/`M65`) drive of that relay.
+
+| Setting | Inverts | Notes |
+|---|---|---|
+| **`$15`** "Invert coolant outputs" | Flood (OUT0), Mist (OUT1) | The intuitive one for coolant — Flood/Mist toggles |
+| **`$372`** "Invert I/O Port outputs" | any of OUT0–OUT3 | Generic per-output invert. Its `Aux N` labels are *function* numbers: **Aux 2 = OUT0, Aux 3 = OUT1, Aux 4 = OUT2, Aux 5 = OUT3** (Aux 0/1 are the on-board PA0/PA8 pins, not DB-25 outputs) |
+
+For OUT0/OUT1 either setting works and they don't stack (an output is inverted if `$15`
+*or* `$372` asks for it). OUT2/OUT3 use `$372` only.
+
 ## NOT yet flashed — open items before/at bring-up
 1. **HSE 8 MHz** extracted from firmware; final proof = USB enumerates after flash.
 2. **Provisional pins** (driver↔axis order, input roles) — verify by jogging /
