@@ -43,6 +43,14 @@
 #define RTS1_DRV_HOLD_CURRENT  0x40   // CTRL10 ISTSL  (idle)   ~0.75 A target
 #define RTS1_DRV_MICROSTEP     0x06   // CTRL2 low nibble: 0x06 = 1/16 (stock); $100-102 = 320/320/800
 
+// True once an internal DRV8452 is confirmed present (echoes a written sentinel). The
+// RTS-2 (external closed-loop drivers, no DRV8452) leaves this false, which disables the
+// driver config, sensorless-stall homing and the VM/UVLO e-stop - all of which read the
+// (absent) chips over SPI and would otherwise false-trigger on floating MISO. Probed in
+// board_init and re-probed by the realtime poller until found (so an RTS-1 that booted
+// with the driver logic dark still picks them up once powered).
+static bool rts1_have_drivers = false;      // set by rts1_drv_present() (defined below drv_read)
+
 // ---- Per-axis run current, adjustable via $140-$143 (Setting_AxisStepperCurrent,
 // the standard grblHAL per-axis motor-current setting; unused by the core and by us
 // for the DRV8452 since we're not Trinamic). Value is approximate mA -> DRV8452
@@ -186,6 +194,17 @@ static bool drv_configure (uint8_t i)
     return ok;
 }
 
+// Probe DRV8452 presence: only a powered chip echoes two DISTINCT values written to a
+// scratch register (CTRL3 = 0x06); floating SPI MISO can't fake both. Leaves CTRL3 at our
+// normal 0x3C. Used to tell an RTS-1 (internal drivers) from an RTS-2 (external drivers).
+static bool rts1_drv_present (void)
+{
+    drv_write(0, 0x06, 0x3C); bool a = drv_read(0, 0x06) == 0x3C;
+    drv_write(0, 0x06, 0x15); bool b = drv_read(0, 0x06) == 0x15;
+    drv_write(0, 0x06, 0x3C);
+    return a && b;
+}
+
 static void rts1_busywait (uint32_t loops) { while(loops--) __NOP(); }
 
 // Stock resets the DRV8452s by pulsing PC15 (the driver reset/enable strap) LOW
@@ -244,12 +263,17 @@ static void rts1_drv8452_init (void)
     // what lets a UVLO-stuck driver recover.
     rts1_drv_reset_pulse();
 
-    // Configure + enable all five drivers, with read-back verification + retry
-    // so a single dropped SPI frame can't leave a driver silently disabled.
-    for(uint8_t i = 0; i < DRV_N; i++) {
-        for(uint8_t tries = 0; tries < 4; tries++) {
-            if(drv_configure(i))
-                break;                              // EN_OUT confirmed set
+    // Detect internal DRV8452s. Absent on the RTS-2 (external closed-loop drivers) -> skip
+    // config so we don't spam SPI to nothing, and (via rts1_have_drivers) disable the
+    // VM/UVLO e-stop + stall homing that would false-trigger on floating reads.
+    if((rts1_have_drivers = rts1_drv_present())) {
+        // Configure + enable all five drivers, with read-back verification + retry
+        // so a single dropped SPI frame can't leave a driver silently disabled.
+        for(uint8_t i = 0; i < DRV_N; i++) {
+            for(uint8_t tries = 0; tries < 4; tries++) {
+                if(drv_configure(i))
+                    break;                          // EN_OUT confirmed set
+            }
         }
     }
 }
@@ -744,6 +768,31 @@ static void rts1_puthex12 (char *b, uint8_t *p, uint16_t v)
     b[(*p)++] = rts1_hexd[v & 0xF];
 }
 
+// One-shot ADC1 read of a single channel (0..15), 12-bit. Used by the "$ADC" diagnostic to
+// hunt for a motor-supply voltage-sense pin on the RTS-2 (stock uses ADC1 for analog sense).
+static uint16_t rts1_adc_read (uint8_t ch)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
+    ADC1->CR1  = 0;                         // 12-bit, single (no scan)
+    ADC1->CR2  = ADC_CR2_ADON;              // enable ADC
+    ADC1->SMPR1 = 0x07FFFFFF;               // ch10-18: 480-cycle sample (slow = tolerant of high-Z)
+    ADC1->SMPR2 = 0x3FFFFFFF;               // ch0-9:   480-cycle sample
+    ADC1->SQR1 = 0;                         // 1 conversion
+    ADC1->SQR3 = ch & 0x1F;
+    // Two conversions: discard the first (lets the sample-and-hold settle to THIS channel,
+    // killing the cross-channel ghosting), return the second.
+    uint16_t v = 0;
+    for(uint8_t k = 0; k < 2; k++) {
+        for(volatile uint32_t d = 0; d < 4000; d++) __NOP();   // settle
+        ADC1->SR &= ~ADC_SR_EOC;
+        ADC1->CR2 |= ADC_CR2_SWSTART;
+        uint32_t to = 200000;
+        while(!(ADC1->SR & ADC_SR_EOC) && --to) ;
+        v = (uint16_t)(ADC1->DR & 0x0FFF);                     // read clears EOC
+    }
+    return v;
+}
+
 // Emit current + minimum TRQ_COUNT, nFAULT(PC5), FAULT reg. TQmin is the lowest the
 // torque count dipped to during this move = how far it gets toward stall before the
 // rotor locks (TRQ reverts to 0x0FFF when not turning). Set STALL_TH a bit ABOVE TQmin.
@@ -785,6 +834,33 @@ static status_code_t rts1_sys_command (sys_state_t state, char *line)
             b[p++]=rts1_hexd[(v>>4)&0xF];  b[p++]=rts1_hexd[v&0xF];
         } else {
             const char *e = "ERR"; while(*e) b[p++] = *e++;
+        }
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
+        return Status_OK;
+    }
+    if(!strcmp(line, "LPIN")) {                      // "$LPIN": raw GPIOA/B/C input registers (find RTS-2 limit wiring)
+        char b[48]; uint8_t p = 0; const char *h = "[MSG:LPIN A=";
+        uint16_t a = (uint16_t)GPIOA->IDR, bb = (uint16_t)GPIOB->IDR, c = (uint16_t)GPIOC->IDR;
+        while(*h) b[p++] = *h++;
+        for(int s = 12; s >= 0; s -= 4) b[p++] = rts1_hexd[(a >> s) & 0xF];
+        h = " B="; while(*h) b[p++] = *h++;
+        for(int s = 12; s >= 0; s -= 4) b[p++] = rts1_hexd[(bb >> s) & 0xF];
+        h = " C="; while(*h) b[p++] = *h++;
+        for(int s = 12; s >= 0; s -= 4) b[p++] = rts1_hexd[(c >> s) & 0xF];
+        b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
+        rts1_emit(b);
+        return Status_OK;
+    }
+    if(!strcmp(line, "ADC")) {                       // "$ADC": read all 16 ADC1 channels (find VM-sense pin)
+        char b[140]; uint8_t p = 0; const char *h = "[MSG:ADC";
+        while(*h) b[p++] = *h++;
+        for(uint8_t ch = 0; ch < 16; ch++) {
+            uint16_t v = rts1_adc_read(ch);
+            b[p++] = ' ';
+            if(ch >= 10) b[p++] = '1', b[p++] = rts1_hexd[ch - 10]; else b[p++] = rts1_hexd[ch];
+            b[p++] = ':';
+            b[p++] = rts1_hexd[(v >> 8) & 0xF]; b[p++] = rts1_hexd[(v >> 4) & 0xF]; b[p++] = rts1_hexd[v & 0xF];
         }
         b[p++] = ']'; b[p++] = '\r'; b[p++] = '\n'; b[p] = '\0';
         rts1_emit(b);
@@ -955,7 +1031,16 @@ static void rts1_realtime (sys_state_t state)
 
     if(now - rts1_poll_last >= 100) {               // poll VM ~10 Hz
         rts1_poll_last = now;
-        if(!rts1_vm_fault) {
+        if(!rts1_have_drivers) {
+            // No internal DRV8452 confirmed yet. Re-probe (cheap): on an RTS-1 that booted
+            // with the driver logic dark (e-stop held / supply ramping) this catches them
+            // once powered; on the RTS-2 (external drivers) it never matches, so the VM/
+            // UVLO e-stop below stays disabled and floating SPI can't fake a fault.
+            if(rts1_drv_present()) {
+                rts1_have_drivers = true;
+                rts1_drv_configured = false;        // force a verified (re)configure next pass
+            }
+        } else if(!rts1_vm_fault) {
             // Healthy: a set UVLO bit means VM just dropped -> e-stop (halt+alarm).
             uint8_t fault = drv_read(0, DRV_FAULT_REG);
             if(fault & DRV_UVLO_BIT) {
